@@ -1,4 +1,4 @@
-# Full-Coverage Location-Routing Planning for Farmland in Complex 3D Geographic Environments
+# Full-Coverage Location-Routing Planning for Farmland under Controlled Complex 3D Geographic Environments: A Case Study of Zunhua, China
 
 This repository contains the Zunhua case-study implementation for the manuscript *Full-Coverage Location-Routing Planning for Farmland under Controlled Complex 3D Geographic Environments: A Case Study of Zunhua, China*.
 
