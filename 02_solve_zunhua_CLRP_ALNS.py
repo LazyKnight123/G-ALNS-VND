@@ -1,19 +1,19 @@
 # -*- coding: utf-8 -*-
-"""CLRP 遵化 DEM+通视+禁飞区分块并行 ALNS（大规模禁飞绕行加速版）。
+"""Zunhua CLRP solver: DEM, line-of-sight, no-fly partitioning, and parallel ALNS (scalable detour edition).
 
-基于 4_CLRP_DEM_通视_ALNS_逻辑删简_起点增减_断点续作版.py，数据切换为 FCLRP遵化数据：
-- 起点集：遵化随机起点集2000/zunhua_random_depots_2000.shp
-- 研究区：遵化市域边界（工作坐标使用米制投影 遵化市_UTM50N.shp，由 遵化市.shp 投影得到）
-- DEM：Zunhua_DEM_12.5_wgs84_研究区插值修复.tif
-- 全景点筛选地块：2020_class_11_12.shp
-- 禁飞铁路：河北铁路数据/hebei_railway.shp
+Adapted from the DEM/LOS ALNS CLRP solver; geospatial inputs now come from FCLRP_Zunhua_data:
+- Candidate sites: zunhua_random_depots_2000/zunhua_random_depots_2000.shp
+- Study area: Zunhua administrative boundary (working CRS is metric zunhua_UTM50N.shp, projected from zunhua.shp)
+- DEM: Zunhua_DEM_12.5_wgs84_study_area_interpolated.tif
+- Farmland polygons used to retain panoramic points: 2020_class_11_12.shp
+- Railway no-fly source: hebei_railway/hebei_railway.shp
 
-主路径：
-途径点/起点读取 -> DEM高度与通视 -> 分块三维矩阵 -> 通视贪心初始解
--> 初始起点结构强化(1→1/1→2/2→2/3→2/3→4) -> 自适应ALNS/VND -> JSON/CSV/NPZ持久化 -> 可重复绘图。
+Main pipeline:
+load waypoints/depots -> DEM heights and line of sight -> block-wise 3D matrices -> visibility-greedy initial solution
+-> initial depot-structure refinement (1→1/1→2/2→2/3→2/3→4) -> adaptive ALNS/VND -> JSON/CSV/NPZ persistence -> reproducible plots.
 
-开放起点数量不设置显式上下限，也不执行“最少起点覆盖数”整数规划预检；
-开放数量由建设成本、航线固定成本、飞行距离及既有起点结构增减算子共同优化。
+The number of open depots has no explicit bounds and there is no integer-program precheck for a minimum covering set;
+it is optimized jointly by construction cost, route fixed cost, flight distance, and the depot-structure operators.
 """
 import os
 import sys
@@ -30,7 +30,7 @@ from datetime import datetime
 from itertools import combinations
 import numpy as np
 import rasterio
-from lib_禁飞区绕行逻辑 import build_navigation_distances, route_navigation_coordinates
+from lib_no_fly_zone_detour import build_navigation_distances, route_navigation_coordinates
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -46,27 +46,27 @@ import shapefile
 from pyproj import CRS, Transformer
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_SCRIPT_DIR)  # 仓库根：仅用于读取 GIS 数据
-_BASE_DIR = _SCRIPT_DIR  # Scripts 工作区：独立 outputs / checkpoints
-_ZUNHUA_GIS_DIR = os.path.join(_REPO_ROOT, 'FCLRP遵化数据')
-# 起点集目录内读取全部 .shp；当前为随机生成的 2000 候选起点。
-_STARTING_POINT_DIR = os.path.join(_ZUNHUA_GIS_DIR, '遵化随机起点集2000')
-# 地理边界源文件（WGS84）；算法工作坐标必须用米制投影版本。
-_ADMIN_BOUNDARY_SHP_WGS84 = os.path.join(_ZUNHUA_GIS_DIR, '遵化市域边界数据', '遵化市.shp')
-_ADMIN_BOUNDARY_SHP = os.path.join(_ZUNHUA_GIS_DIR, '遵化市域边界数据', '遵化市_UTM50N.shp')
+_REPO_ROOT = os.path.dirname(_SCRIPT_DIR)  # repository parent: GIS data only
+_BASE_DIR = _SCRIPT_DIR  # script workspace: local outputs / checkpoints
+_ZUNHUA_GIS_DIR = os.path.join(_REPO_ROOT, 'FCLRP_Zunhua_data')
+# Read every .shp in the candidate-site directory; currently a random set of 2000 depots.
+_STARTING_POINT_DIR = os.path.join(_ZUNHUA_GIS_DIR, 'zunhua_random_depots_2000')
+# Geographic boundary source (WGS84); the solver must use the metric projected version.
+_ADMIN_BOUNDARY_SHP_WGS84 = os.path.join(_ZUNHUA_GIS_DIR, 'zunhua_admin_boundary', 'zunhua.shp')
+_ADMIN_BOUNDARY_SHP = os.path.join(_ZUNHUA_GIS_DIR, 'zunhua_admin_boundary', 'zunhua_UTM50N.shp')
 CLRP_ENABLE_NO_FLY_ZONE = True
 
-# 输出命名：目录 outputs/CLRP_{中文实验名}/；子目录与文件均用中文实验名区分。
-_EXPERIMENT_ID = '遵化'
+# Output naming: directory outputs/CLRP_{experiment_id}/; subfolders and files use the same experiment id.
+_EXPERIMENT_ID = 'zunhua'
 _OUTPUT_DIR = os.path.join(_BASE_DIR, 'outputs', f'CLRP_{_EXPERIMENT_ID}')
 os.makedirs(_OUTPUT_DIR, exist_ok=True)
 _SCENARIO_DIR_LABELS = {
-    'with_no_fly_zone': '有禁飞区',
-    'without_no_fly_zone': '无禁飞区',
+    'with_no_fly_zone': 'with_no_fly_zone',
+    'without_no_fly_zone': 'without_no_fly_zone',
 }
 
 def _output_stem(*parts):
-    """统一输出文件主名：中文实验名_语义段_..."""
+    """Build a unified output stem: experiment_id_semantic_parts_..."""
     chunks = [_EXPERIMENT_ID]
     for part in parts:
         if part is None:
@@ -77,15 +77,15 @@ def _output_stem(*parts):
     return '_'.join(chunks)
 
 def _run_output_dirname(scenario_label, max_iter):
-    """统一中文运行子目录：有禁飞区_迭代_1000"""
+    """Unified run subdirectory, e.g. with_no_fly_zone_iter_1000"""
     scenario_dir = _SCENARIO_DIR_LABELS.get(str(scenario_label), _sanitize_filename(scenario_label))
-    return f'{scenario_dir}_迭代_{int(max_iter)}'
-_RAILWAY_SHP = os.path.join(_ZUNHUA_GIS_DIR, '河北铁路数据', 'hebei_railway.shp')
-_FARMLAND_SHP = os.path.join(_ZUNHUA_GIS_DIR, '遵化地块数据', '2020_class_11_12.shp')
-_DEM_TIF = os.path.join(_ZUNHUA_GIS_DIR, '遵化DEM数据', 'Zunhua_DEM_12.5_wgs84_研究区插值修复.tif')
+    return f'{scenario_dir}_iter_{int(max_iter)}'
+_RAILWAY_SHP = os.path.join(_ZUNHUA_GIS_DIR, 'hebei_railway', 'hebei_railway.shp')
+_FARMLAND_SHP = os.path.join(_ZUNHUA_GIS_DIR, 'zunhua_farmland', '2020_class_11_12.shp')
+_DEM_TIF = os.path.join(_ZUNHUA_GIS_DIR, 'zunhua_DEM', 'Zunhua_DEM_12.5_wgs84_study_area_interpolated.tif')
 CLRP_RAILWAY_BUFFER_DISTANCE = 500.0
 CLRP_NAVIGATION_CLEARANCE = 100.0
-# 大规模绕行矩阵参数：保持近切线逻辑，但限制边界节点和接入候选规模。
+# Scalable detour-matrix parameters: keep near-tangent logic while limiting boundary nodes and access candidates.
 CLRP_NAVIGATION_BOUNDARY_STEP = 50.0
 CLRP_NAVIGATION_BOUNDARY_NEIGHBORS = 8
 CLRP_NAVIGATION_BOUNDARY_LINK_NEIGHBORS = 2
@@ -110,25 +110,25 @@ CLRP_DEM_PROFILE_STEP = 30.0
 CLRP_TERRAIN_INTERSECTION_TOLERANCE = 0.01
 CLRP_REUSE_MATRIX_CHECKPOINTS = True
 CLRP_MATRIX_CHECKPOINT_VERSION = '20260731_zunhua_scalable_detour_v1_scripts'
-# float32公里级距离矩阵的一致性校验容差。不能使用1e-6米的严格绝对误差，
-# 否则同一组分量经不同浮点运算路径求和时会产生毫米级“假不一致”。
+# Consistency tolerance for kilometre-scale float32 distance matrices. A strict 1e-6 m absolute tolerance is too tight,
+# because the same components summed along different float paths can differ by millimetres.
 CLRP_DISTANCE_MATRIX_CHECK_RTOL = 1e-6
 CLRP_DISTANCE_MATRIX_CHECK_ATOL = 2e-3
 _MATRIX_CHECKPOINT_DIR = os.path.join(_BASE_DIR, 'checkpoints', 'zunhua_scalable_detour_matrices')
 os.makedirs(_MATRIX_CHECKPOINT_DIR, exist_ok=True)
 
 def _compose_total_flight_distance(ascent, horizontal, descent):
-    """以统一的float32运算顺序合成总飞行距离矩阵。
+    """Compose the total flight-distance matrix with a single float32 evaluation order.
 
-    统一采用 ``(ascent + horizontal) + descent``，避免“先以float64求和再
-    转float32”和“各分量先转float32再求和”形成毫米级舍入差异。
-    消融 ``CLRP_ABLATION_PLANAR_DISTANCE`` 开启时仅返回水平距离。
+    Always use ``(ascent + horizontal) + descent`` to avoid millimetre rounding differences between
+    "sum in float64 then cast" and "cast each component then sum".
+    When the ``CLRP_ABLATION_PLANAR_DISTANCE`` ablation is on, return horizontal distance only.
     """
     ascent = np.asarray(ascent, dtype=np.float32)
     horizontal = np.asarray(horizontal, dtype=np.float32)
     descent = np.asarray(descent, dtype=np.float32)
     if ascent.shape != horizontal.shape or ascent.shape != descent.shape:
-        raise ValueError('上升、平飞和下降距离矩阵形状不一致')
+        raise ValueError('ascent, horizontal, and descent distance matrices have inconsistent shapes')
     if _ablation_planar_distance():
         return np.asarray(horizontal, dtype=np.float32).copy()
     with np.errstate(invalid='ignore', over='ignore'):
@@ -139,7 +139,7 @@ def _compose_total_flight_distance(ascent, horizontal, descent):
         )
 
 def _distance_matrix_consistency_report(supplied_total, rebuilt_total):
-    """返回总距离矩阵与分量重构矩阵的一致性诊断。"""
+    """Return a consistency report between the supplied total matrix and the rebuilt component sum."""
     supplied = np.asarray(supplied_total, dtype=np.float32)
     rebuilt = np.asarray(rebuilt_total, dtype=np.float32)
     if supplied.shape != rebuilt.shape:
@@ -182,23 +182,23 @@ def _distance_matrix_consistency_report(supplied_total, rebuilt_total):
     }
 
 def _ensure_metric_admin_boundary():
-    """若米制研究区边界缺失，则由 WGS84 遵化市.shp 投影生成 EPSG:32650 版本。"""
+    """If the metric study-area boundary is missing, project WGS84 zunhua.shp to EPSG:32650."""
     if os.path.isfile(_ADMIN_BOUNDARY_SHP) and os.path.isfile(os.path.splitext(_ADMIN_BOUNDARY_SHP)[0] + '.prj'):
         return _ADMIN_BOUNDARY_SHP
     if not os.path.isfile(_ADMIN_BOUNDARY_SHP_WGS84):
-        raise FileNotFoundError(f'找不到遵化市边界：{_ADMIN_BOUNDARY_SHP_WGS84}')
+        raise FileNotFoundError(f'Zunhua boundary not found: {_ADMIN_BOUNDARY_SHP_WGS84}')
     try:
         import geopandas as gpd
     except ImportError as exc:
-        raise ImportError('生成米制研究区边界需要 geopandas') from exc
+        raise ImportError('geopandas is required to generate the metric study-area boundary') from exc
     gdf = gpd.read_file(_ADMIN_BOUNDARY_SHP_WGS84).to_crs('EPSG:32650')
     os.makedirs(os.path.dirname(_ADMIN_BOUNDARY_SHP), exist_ok=True)
     gdf.to_file(_ADMIN_BOUNDARY_SHP, encoding='utf-8')
-    print(f'[遵化数据] 已由 WGS84 边界生成米制工作边界：{_ADMIN_BOUNDARY_SHP}')
+    print(f'[Zunhua data] generated metric working boundary from WGS84: {_ADMIN_BOUNDARY_SHP}')
     return _ADMIN_BOUNDARY_SHP
 
 _ensure_metric_admin_boundary()
-# 不设置开放起点数量上限；该兼容参数不参与任何数量约束。
+# No upper bound on the number of open depots; this compatibility parameter is unused as a count constraint.
 CLRP_N_SELECTED_DEPOTS = None
 CLRP_CUSTOMER_DEMAND = 10.0
 CLRP_R2_UAV_SERVICE_RADIUS = 10000.0
@@ -221,32 +221,32 @@ CLRP_SEGMENT_LENGTH = 50
 CLRP_STAGNATION_LIMIT = 220
 CLRP_ELITE_SIZE = 10
 CLRP_INITIAL_SWAP_PASSES = 8
-# 初始解起点结构强化：通视贪心路线构造后，依次执行2→2、3→2、3→4局部重构。
+# Initial depot-structure refinement: after visibility-greedy routing, apply 2→2, 3→2, and 3→4 local rebuilds.
 CLRP_INITIAL_FACILITY_REFINEMENT = True
-# 连续多少轮三类操作均未降低总成本后，认为初始起点结构基本收敛。
+# Stop initial refinement after this many consecutive passes with no total-cost decrease.
 CLRP_INITIAL_FACILITY_NO_IMPROVE_LIMIT = 20
-# 安全上限，防止连续改进时初始强化阶段运行过久。
+# Hard cap so a sequence of improving moves cannot keep the initial stage running too long.
 CLRP_INITIAL_FACILITY_MAX_PASSES = 80
-# “相邻起点”采用同一自由飞行分块内的K近邻图定义。
+# "Adjacent depots" are defined by a K-NN graph inside the same free-flight block.
 CLRP_INITIAL_FACILITY_K_NEIGHBORS = 4
-# 新起点必须位于原局部途径点包围盒向外扩展的范围内。
+# Replacement depots must lie inside the buffered bounding box of the local waypoints.
 CLRP_INITIAL_FACILITY_REGION_BUFFER = 1500.0
-# 每个局部区域最多保留的候选起点数，控制组合规模。
+# Maximum candidate depots kept per local region, to control combinatorial size.
 CLRP_INITIAL_FACILITY_CANDIDATE_POOL = 12
-# 经通视覆盖和代理成本筛选后，最多进行完整路线重构的候选组合数。
+# Maximum depot combinations that receive a full route rebuild after visibility and proxy-cost screening.
 CLRP_INITIAL_FACILITY_EXACT_TRIALS = 16
-# 途径点数量与300m覆盖圆并集面积的综合权重。
+# Combined weight of waypoint count and the union area of 300 m coverage circles.
 CLRP_INITIAL_FACILITY_COUNT_WEIGHT = 0.5
 CLRP_INITIAL_FACILITY_AREA_WEIGHT = 0.5
-# 至少降低该成本量才接受局部起点重构。
+# Accept a local depot rebuild only if cost falls by at least this amount.
 CLRP_INITIAL_FACILITY_MIN_IMPROVEMENT = 1e-06
-# 初始阶段凡增加开放起点数量（1→2、3→4），当前分块总成本必须严格下降超过5%。
+# In the initial stage, any move that adds an open depot (1→2, 3→4) must cut the block cost by more than 5%.
 CLRP_INITIAL_FACILITY_EXPAND_MIN_REL_IMPROVEMENT = 0.05
-# ALNS阶段三类起点结构算子（2→2、3→2、3→4）必须严格下降超过1%才输出候选解。
+# During ALNS, the three depot-structure operators (2→2, 3→2, 3→4) must cut cost by more than 1% to emit a candidate.
 CLRP_ALNS_FACILITY_MIN_REL_IMPROVEMENT = 0.01
-# 起点结构算子计算较重，初始权重低于普通途径点破坏算子；后续仍由ALNS自适应更新。
+# Depot-structure operators are expensive, so their initial weights are lower than waypoint destroy operators; ALNS still adapts them later.
 CLRP_ALNS_FACILITY_INITIAL_WEIGHT = 0.20
-# ALNS每次起点结构破坏从排名靠前的局部区域中随机选择一个进行完整重构。
+# Each ALNS depot-structure destroy picks one high-ranked local region at random and fully rebuilds it.
 CLRP_ALNS_FACILITY_RANK_POOL = 20
 
 
@@ -254,25 +254,25 @@ CLRP_ALNS_FACILITY_RANK_POOL = 20
 CLRP_PARALLEL_RANDOM_SEEDS = [11, 23, 37, 72, 211]
 CLRP_PARALLEL_MAX_WORKERS = 8
 CLRP_CONSOLE_PROGRESS_INTERVAL = 1
-# ALNS轻量断点续作：每50代原子保存一次，重启后自动恢复。
+# Lightweight ALNS resume: atomically save every 50 iterations and restore after a restart.
 CLRP_ALNS_RESUME = True
 CLRP_ALNS_CHECKPOINT_INTERVAL = 50
-# 终局 VND 已从主算法移除：路径局部搜索仅在 ALNS 迭代内按策略触发。
-# 更新全局最优解要求的最小相对改进（0.01% = 1e-4）；更小的数值波动不记为新最优。
+# Terminal VND has been removed from the main algorithm: route local search runs only inside ALNS iterations.
+# A new global best requires at least this relative improvement (0.01% = 1e-4); smaller numerical jitter is ignored.
 CLRP_BEST_MIN_REL_IMPROVEMENT = 1e-4
 CLRP_EXPERIMENT_NO_FLY_SHP = _DEFAULT_NO_FLY_SHP
 CLRP_REPLOT_RESULT_JSON = ''
-# 消融实验开关（默认关闭，不影响基线）。子进程通过同名环境变量同步。
+# Ablation switches (off by default, baseline unchanged). Worker processes inherit the same environment variables.
 CLRP_ABLATION_IGNORE_DEM_LOS = False
 CLRP_ABLATION_PLANAR_DISTANCE = False
 CLRP_ABLATION_DISABLE_FACILITY_OPS = False
-# 以下开关将“初始设施强化”和“ALNS 设施算子”拆开；默认关闭，
-# 因而不改变既有主实验与已完成实验的任何行为。
+# The switch below separates initial facility refinement from ALNS facility operators; it is off by default,
+# so existing main experiments keep their original behaviour.
 CLRP_ABLATION_DISABLE_ALNS_FACILITY_OPS = False
-# 迭代内 VND 的最大轮数。显式定义后可用 0 作纯 ALNS 消融。
+# Maximum in-iteration VND rounds. Set to 0 for a pure-ALNS ablation.
 CLRP_VND_MAX_ROUNDS = 4
-# 自适应 VND（默认关闭，保持既有固定 4 轮实验的行为不变）：普通改进候选仅做
-# 轻量搜索，接近/刷新历史最优的精英候选才做深度搜索；周期性检查也只做轻量搜索。
+# Adaptive VND (off by default, preserving the previous fixed 4-round experiments): ordinary improving candidates get a
+# light search; elite candidates near or better than the historic best get a deep search; periodic checks stay light.
 CLRP_VND_ADAPTIVE_MODE = False
 CLRP_VND_LIGHT_MAX_ROUNDS = 1
 CLRP_VND_ELITE_MAX_ROUNDS = 4
@@ -297,7 +297,7 @@ def _ablation_disable_facility_ops():
 
 
 def _ablation_disable_alns_facility_ops():
-    """兼容旧的总开关，同时支持只关闭 ALNS 设施算子。"""
+    """Keep the legacy master switch while also allowing ALNS facility operators to be disabled on their own."""
     return (_ablation_disable_facility_ops()
             or bool(CLRP_ABLATION_DISABLE_ALNS_FACILITY_OPS)
             or _env_flag_true('CLRP_ABLATION_DISABLE_ALNS_FACILITY_OPS'))
@@ -357,10 +357,10 @@ def _load_matrix_checkpoint(kind, key, expected_shapes=None):
         for name, shape in (expected_shapes or {}).items():
             if name not in arrays or tuple(arrays[name].shape) != tuple(shape):
                 return None
-        print(f'[矩阵检查点] 已复用：{npz_path}')
+        print(f'[matrix checkpoint] reused: {npz_path}')
         return (arrays, metadata)
     except Exception as exc:
-        print(f'[矩阵检查点] 读取失败，将重新计算：{npz_path}；{exc}')
+        print(f'[matrix checkpoint] read failed, recomputing: {npz_path}; {exc}')
         return None
 
 def _save_matrix_checkpoint(kind, key, arrays, metadata=None):
@@ -376,7 +376,7 @@ def _save_matrix_checkpoint(kind, key, arrays, metadata=None):
             json.dump(payload, file_obj, ensure_ascii=False, indent=2)
         os.replace(tmp_npz, npz_path)
         os.replace(tmp_json, json_path)
-        print(f'[矩阵检查点] 已保存：{npz_path}')
+        print(f'[matrix checkpoint] saved: {npz_path}')
     finally:
         for temp_path in (tmp_npz, tmp_json):
             if os.path.exists(temp_path):
@@ -402,7 +402,7 @@ def _save_navigation_checkpoint(key, horizontal_distances, no_fly_crossing, navi
             os.replace(tmp_pickle, pickle_path)
             pickle_saved = True
         except Exception as exc:
-            print(f'[导航检查点] 绕行路径对象无法序列化，仅保存矩阵：{exc}')
+            print(f'[navigation checkpoint] detour-path object is not serializable; saving matrices only: {exc}')
         finally:
             if os.path.exists(tmp_pickle):
                 try:
@@ -426,13 +426,13 @@ def _load_navigation_checkpoint(key, n_nodes):
     if metadata.get('navigation_data_required'):
         pickle_path = metadata.get('navigation_pickle_path') or _navigation_checkpoint_pickle_path(key)
         if not metadata.get('navigation_pickle_saved') or not os.path.exists(pickle_path):
-            print('[导航检查点] 缺少绕行路径对象，将重新计算二维导航。')
+            print('[navigation checkpoint] missing detour-path object; recomputing 2D navigation.')
             return None
         try:
             with open(pickle_path, 'rb') as file_obj:
                 navigation_data = pickle.load(file_obj)
         except Exception as exc:
-            print(f'[导航检查点] 绕行路径对象读取失败，将重新计算：{exc}')
+            print(f'[navigation checkpoint] failed to read detour-path object; recomputing: {exc}')
             return None
     return (arrays['horizontal_navigation'].astype(np.float32, copy=False), arrays['no_fly_crossing'].astype(bool), navigation_data)
 
@@ -449,7 +449,7 @@ def _iter_polygonal_parts(geometry):
 
 def load_polygonal_area_geometry(shp_path):
     if not shp_path or not os.path.exists(shp_path):
-        raise FileNotFoundError(f'随机生成候选起降点需要行政区面文件，但未找到：{shp_path}')
+        raise FileNotFoundError(f'Random candidate take-off/landing sites require an administrative polygon file, but it was not found: {shp_path}')
     sf = shapefile.Reader(shp_path)
     polygon_parts = []
     for shp_obj in sf.shapes():
@@ -458,12 +458,12 @@ def load_polygonal_area_geometry(shp_path):
             geom = geom.buffer(0)
         polygon_parts.extend(_iter_polygonal_parts(geom))
     if not polygon_parts:
-        raise ValueError(f'行政区文件不包含有效面几何：{shp_path}')
+        raise ValueError(f'administrative file contains no valid polygon geometry: {shp_path}')
     merged = unary_union(polygon_parts)
     if not merged.is_valid:
         merged = merged.buffer(0)
     if merged.is_empty or merged.area <= 0:
-        raise ValueError(f'行政区面几何为空或面积无效：{shp_path}')
+        raise ValueError(f'administrative polygon is empty or has invalid area: {shp_path}')
     return merged
 
 def build_candidate_feasible_area(administrative_geometry, prohibited_polygons=None):
@@ -473,32 +473,32 @@ def build_candidate_feasible_area(administrative_geometry, prohibited_polygons=N
         feasible = feasible.buffer(0)
     polygon_parts = list(_iter_polygonal_parts(feasible))
     if not polygon_parts:
-        raise ValueError('行政区扣除禁入面后没有可用区域')
+        raise ValueError('no usable area remains after subtracting exclusion polygons from the administrative boundary')
     feasible = unary_union(polygon_parts)
-    print(f'候选点可行域面积：{feasible.area / 1000000.0:.2f} km²')
+    print(f'feasible area for candidate sites: {feasible.area / 1000000.0:.2f} km²')
     return feasible
 
 def _read_prj_crs(dataset_path):
     prj_path = os.path.splitext(os.fspath(dataset_path))[0] + '.prj'
     if not os.path.exists(prj_path):
-        raise FileNotFoundError(f'矢量数据缺少坐标系文件：{prj_path}')
+        raise FileNotFoundError(f'vector dataset is missing a CRS file: {prj_path}')
     with open(prj_path, encoding='utf-8-sig') as file_obj:
         return CRS.from_wkt(file_obj.read())
 
-def _require_metric_projected_crs(crs, label='工作坐标系'):
+def _require_metric_projected_crs(crs, label='working CRS'):
     crs = CRS.from_user_input(crs)
     if not crs.is_projected:
-        raise ValueError(f'{label}必须是投影坐标系，不能直接使用经纬度坐标。')
+        raise ValueError(f'{label}must be a projected CRS; geographic lon/lat coordinates cannot be used directly.')
     axis_info = crs.axis_info or []
     if axis_info:
         factor = axis_info[0].unit_conversion_factor
         if factor is not None and abs(float(factor) - 1.0) > 1e-09:
-            raise ValueError(f'{label}的平面单位必须为米，当前单位={axis_info[0].unit_name}')
+            raise ValueError(f'{label} planar units must be metres, current unit={axis_info[0].unit_name}')
     return crs
 
 def load_polygonal_geometry_reprojected(shp_path, target_crs):
     if not shp_path or not os.path.exists(shp_path):
-        raise FileNotFoundError(f'面矢量文件不存在：{shp_path}')
+        raise FileNotFoundError(f'polygon shapefile does not exist: {shp_path}')
     source_crs = _read_prj_crs(shp_path)
     transformer = Transformer.from_crs(source_crs, target_crs, always_xy=True)
     parts = []
@@ -509,7 +509,7 @@ def load_polygonal_geometry_reprojected(shp_path, target_crs):
             geometry = geometry.buffer(0)
         parts.extend(_iter_polygonal_parts(geometry))
     if not parts:
-        raise ValueError(f'面矢量不包含有效面要素：{shp_path}')
+        raise ValueError(f'polygon shapefile contains no valid polygon features: {shp_path}')
     merged = unary_union(parts)
     if not merged.is_valid:
         merged = merged.buffer(0)
@@ -519,7 +519,7 @@ class DEMTerrainModel:
 
     def __init__(self, dem_path, working_crs):
         if not dem_path or not os.path.exists(dem_path):
-            raise FileNotFoundError(f'DEM文件不存在：{dem_path}')
+            raise FileNotFoundError(f'DEM file does not exist: {dem_path}')
         with rasterio.open(dem_path) as dataset:
             self.array = dataset.read(1).astype(float)
             self.transform = dataset.transform
@@ -558,7 +558,7 @@ class DEMTerrainModel:
     def _normalize_polyline(polyline):
         coords = np.asarray(polyline, dtype=float)
         if coords.ndim != 2 or coords.shape[1] < 2 or len(coords) < 2:
-            raise ValueError('地形剖面路径至少需要两个二维坐标点')
+            raise ValueError('a terrain profile needs at least two 2D coordinates')
         coords = coords[:, :2]
         keep = np.r_[True, np.any(np.abs(np.diff(coords, axis=0)) > 1e-10, axis=1)]
         coords = coords[keep]
@@ -595,7 +595,7 @@ class DEMTerrainModel:
         distance_3d = math.hypot(planar, float(end_height) - float(start_height))
         if distance_3d >= float(max_distance) - 1e-10:
             return (False, 'OUT_OF_RANGE', distance_3d)
-        # 消融：忽略 DEM 地形遮挡，仅保留通视限距球约束。
+        # Ablation: ignore DEM terrain occlusion and keep only the line-of-sight range sphere.
         if _ablation_ignore_dem_los():
             return (True, 'VISIBLE_ABLATION_IGNORE_DEM', distance_3d)
         distances, terrain = self.sample_profile([start_xy, end_xy])
@@ -641,7 +641,7 @@ def _navigation_pair_coordinates(navigation_data, coords, i, j):
         return np.asarray([coords[i], coords[j]], dtype=float)
     routed = np.asarray(route_navigation_coordinates(navigation_data, [int(i), int(j)]), dtype=float)
     if routed.ndim != 2 or routed.shape[1] < 2 or len(routed) < 2:
-        raise ValueError(f'节点 {i}->{j} 的绕行坐标无效')
+        raise ValueError(f'detour coordinates for nodes {i}->{j} are invalid')
     return routed[:, :2]
 
 def build_three_dimensional_flight_matrices(coords, flight_heights, dem_model, navigation_data, horizontal_distances, node_ids, global_coords):
@@ -651,14 +651,14 @@ def build_three_dimensional_flight_matrices(coords, flight_heights, dem_model, n
     global_coords = np.asarray(global_coords, dtype=float)
     n = len(coords)
     if len(node_ids) != n:
-        raise ValueError('node_ids长度必须与局部节点数一致')
+        raise ValueError('node_ids length must match the number of local nodes')
     total_matrix = np.zeros((n, n), dtype=np.float32)
     ascent_matrix = np.zeros((n, n), dtype=np.float32)
     horizontal_matrix = np.zeros((n, n), dtype=np.float32)
     descent_matrix = np.zeros((n, n), dtype=np.float32)
     cruise_matrix = np.full((n, n), np.nan, dtype=np.float32)
     np.fill_diagonal(cruise_matrix, heights)
-    print(f'=== 预计算DEM方向性飞行矩阵（{n}×{n}） ===')
+    print(f'=== Precomputing DEM directional flight matrix ({n}×{n}) ===')
     for i in range(n):
         for j in range(i + 1, n):
             global_i, global_j = (int(node_ids[i]), int(node_ids[j]))
@@ -667,7 +667,7 @@ def build_three_dimensional_flight_matrices(coords, flight_heights, dem_model, n
                 try:
                     polyline = _navigation_pair_coordinates(navigation_data, global_coords, global_i, global_j)
                 except ValueError:
-                    print(f'[绕行路径不可还原] 节点 {global_i}->{global_j}，按不可达航段处理。')
+                    print(f'[detour path not recoverable] nodes {global_i}->{global_j}; treat the leg as unreachable.')
                     horizontal = float('inf')
             if np.isfinite(horizontal):
                 terrain_max = dem_model.terrain_max(polyline)
@@ -688,29 +688,29 @@ def build_three_dimensional_flight_matrices(coords, flight_heights, dem_model, n
             ascent_matrix[i, j], descent_matrix[i, j] = (ascent_ij, descent_ij)
             ascent_matrix[j, i], descent_matrix[j, i] = (ascent_ji, descent_ji)
         if i and i % 50 == 0:
-            print(f'  已处理 {i}/{n} 个节点...')
+            print(f'  processed {i}/{n} nodes...')
     finite_edges = total_matrix[np.isfinite(total_matrix) & (total_matrix > 0)]
     if finite_edges.size:
-        print(f'飞行矩阵完成：平均={finite_edges.mean() / 1000:.3f}km，最大={finite_edges.max() / 1000:.3f}km')
+        print(f'flight matrix done: mean={finite_edges.mean() / 1000:.3f} km, max={finite_edges.max() / 1000:.3f} km')
     return (total_matrix, ascent_matrix, horizontal_matrix, descent_matrix, cruise_matrix)
 
 def load_candidate_depots_from_starting_points(administrative_boundary_shp, prohibited_polygons=None, start_point_dir=_STARTING_POINT_DIR):
     shp_paths = sorted(glob.glob(os.path.join(start_point_dir, '*.shp')))
     if not shp_paths:
-        raise FileNotFoundError(f'起点集目录中未找到 .shp 点文件：{start_point_dir}')
+        raise FileNotFoundError(f'no point .shp found in the candidate-site directory: {start_point_dir}')
     administrative_geometry = load_polygonal_area_geometry(administrative_boundary_shp)
     base_capacity = float(CLRP_DEPOT_CAPACITY)
     base_build_cost = float(CLRP_DEPOT_BUILD_COST)
     boundary_prj = os.path.splitext(administrative_boundary_shp)[0] + '.prj'
     if not os.path.exists(boundary_prj):
-        raise FileNotFoundError(f'研究范围缺少坐标系文件：{boundary_prj}')
+        raise FileNotFoundError(f'study-area shapefile is missing a CRS file: {boundary_prj}')
     target_crs = CRS.from_wkt(open(boundary_prj, encoding='utf-8-sig').read())
     no_fly = [poly for poly in prohibited_polygons or [] if not poly.is_empty]
     candidate_xy, seen, dropped = ([], set(), 0)
     for shp_path in shp_paths:
         prj_path = os.path.splitext(shp_path)[0] + '.prj'
         if not os.path.exists(prj_path):
-            raise FileNotFoundError(f'起点集缺少坐标系文件：{prj_path}')
+            raise FileNotFoundError(f'candidate-site shapefile is missing a CRS file: {prj_path}')
         source_crs = CRS.from_wkt(open(prj_path, encoding='utf-8-sig').read())
         transformer = Transformer.from_crs(source_crs, target_crs, always_xy=True)
         for shape_record in shapefile.Reader(shp_path).shapes():
@@ -724,8 +724,8 @@ def load_candidate_depots_from_starting_points(administrative_boundary_shp, proh
                 seen.add(key)
                 candidate_xy.append((x, y))
     if not candidate_xy:
-        raise ValueError('起点集经研究范围/禁飞区筛选后没有可用候选点')
-    print(f'起点集文件数：{len(shp_paths)}；可用候选点：{len(candidate_xy)}；剔除重复或不合规点：{dropped}')
+        raise ValueError('no candidate sites remain after study-area / no-fly filtering')
+    print(f'candidate-site files: {len(shp_paths)}; usable points: {len(candidate_xy)}; dropped duplicates/invalid: {dropped}')
     generated = []
     for idx, (x, y) in enumerate(candidate_xy):
         generated.append([float(idx), float(x), float(y), base_capacity, base_build_cost, float(CLRP_DEPOT_EXTRA_VALUE)])
@@ -734,16 +734,16 @@ def load_candidate_depots_from_starting_points(administrative_boundary_shp, proh
 def generate_hexagonal_customer_data(administrative_boundary_shp, prohibited_polygons=None, hex_side_length=CLRP_WAYPOINT_CIRCLE_RADIUS, customer_demand=CLRP_CUSTOMER_DEMAND, farmland_shp=_FARMLAND_SHP):
     radius = float(hex_side_length)
     if radius <= 0:
-        raise ValueError('CLRP_WAYPOINT_CIRCLE_RADIUS 必须大于0')
+        raise ValueError('CLRP_WAYPOINT_CIRCLE_RADIUS must be greater than 0')
     administrative_geometry = load_polygonal_area_geometry(administrative_boundary_shp)
     feasible = build_candidate_feasible_area(administrative_geometry, prohibited_polygons)
-    target_crs = _require_metric_projected_crs(_read_prj_crs(administrative_boundary_shp), '研究区坐标系')
+    target_crs = _require_metric_projected_crs(_read_prj_crs(administrative_boundary_shp), 'study-area CRS')
     farmland = load_polygonal_geometry_reprojected(farmland_shp, target_crs)
     farmland_parts = [part for part in _iter_polygonal_parts(farmland) if part is not None and (not part.is_empty)]
     farmland_tree = STRtree(farmland_parts)
     prepared_feasible = prep(feasible)
     minx, miny, maxx, maxy = feasible.bounds
-    # 六边形布点：任意相邻圆心距 = R * √3（同行间距 x_step，奇数行半步错列）。
+    # Hexagonal layout: adjacent centre spacing = R * √3 (row step x_step, odd rows offset by half a step).
     x_step = radius * math.sqrt(3.0)
     y_step = 1.5 * radius
     customers = []
@@ -768,9 +768,9 @@ def generate_hexagonal_customer_data(administrative_boundary_shp, prohibited_pol
         y += y_step
         row += 1
     if not customers:
-        raise ValueError('没有生成与耕地图斑相交的途径点；请检查坐标系、图斑文件或圆半径')
-    print(f'覆盖圆半径：{radius:.1f}m；相邻圆心距：{x_step:.1f}m（R√3）；同行间距：{x_step:.1f}m；相邻行间距：{y_step:.1f}m')
-    print(f'自由飞行区候选圆心：{generated_count}；与耕地图斑相交并保留：{len(customers)}；筛除：{generated_count - len(customers)}')
+        raise ValueError('no waypoints intersect farmland polygons; check CRS, polygon file, or circle radius')
+    print(f'coverage radius: {radius:.1f} m; adjacent centre spacing: {x_step:.1f} m (R√3); row step: {x_step:.1f} m; row spacing: {y_step:.1f} m')
+    print(f'free-flight candidate centres: {generated_count}; retained after farmland intersection: {len(customers)}; dropped: {generated_count - len(customers)}')
     return customers
 
 def _build_clrp_arrays(customer_data, depot_data, n_selected_depots, max_vehicles_per_depot, vehicle_cap, penalize_long_edges=False):
@@ -797,10 +797,10 @@ def _build_clrp_arrays(customer_data, depot_data, n_selected_depots, max_vehicle
     else:
         vehicle_cap = int(vehicle_cap)
     total_demand = float(sum(demands))
-    # 未设置开放起点数量上限时，仅检查全部候选起点共同提供的理论最大容量。
+    # With no open-depot count cap, only check the theoretical capacity of all candidate depots together.
     max_total_cap = n_depot_candidates * max_vehicles_per_depot * vehicle_cap
     if total_demand > max_total_cap:
-        raise ValueError(f'总需求{total_demand:.0f}超过全部候选起点可提供的理论最大容量{max_total_cap:.0f}，请增加候选起点、单起点航线数上限或单航线容量')
+        raise ValueError(f'total demand {total_demand:.0f} exceeds the theoretical capacity {max_total_cap:.0f} of all candidate depots; add candidates, raise routes-per-depot, or raise route capacity')
     dist_matrix = np.zeros((len(all_nodes), len(all_nodes)))
     for i in all_nodes:
         for j in all_nodes:
@@ -813,26 +813,26 @@ def _build_clrp_arrays(customer_data, depot_data, n_selected_depots, max_vehicle
     return (n_depot_candidates, n_selected_depots, n_customers, max_vehicles_per_depot, vehicle_cap, depot_candidates, customers, all_nodes, coords, depot_build_cost, demands, dist_matrix)
 
 def load_zunhua_UAV_data_for_CLRP(administrative_boundary_shp=_ADMIN_BOUNDARY_SHP, prohibited_polygons=None, route_prohibited_polygons=None, n_selected_depots=CLRP_N_SELECTED_DEPOTS, max_vehicles_per_depot=50, vehicle_cap=100, max_route_length=CLRP_MAX_ROUTE_LENGTH):
-    print('=== 开始读取遵化UAV数据集（DEM+通视增强版） ===')
-    print(f'行政区可行域文件（工作投影）：{administrative_boundary_shp}')
-    print(f'研究区边界原始WGS84：{_ADMIN_BOUNDARY_SHP_WGS84}')
-    print(f'地块筛选矢量：{_FARMLAND_SHP}')
-    print(f'DEM文件：{_DEM_TIF}')
+    print('=== Loading Zunhua UAV dataset (DEM + line-of-sight) ===')
+    print(f'administrative feasible-area file (working projection): {administrative_boundary_shp}')
+    print(f'original WGS84 study-area boundary: {_ADMIN_BOUNDARY_SHP_WGS84}')
+    print(f'farmland filter shapefile: {_FARMLAND_SHP}')
+    print(f'DEM file: {_DEM_TIF}')
     customer_data = generate_hexagonal_customer_data(administrative_boundary_shp, prohibited_polygons, hex_side_length=CLRP_WAYPOINT_CIRCLE_RADIUS, farmland_shp=_FARMLAND_SHP)
     generated_depot_data = load_candidate_depots_from_starting_points(administrative_boundary_shp=administrative_boundary_shp, prohibited_polygons=prohibited_polygons)
     route_polygons = prohibited_polygons if route_prohibited_polygons is None else route_prohibited_polygons
-    target_crs = _require_metric_projected_crs(_read_prj_crs(administrative_boundary_shp), '研究区坐标系')
+    target_crs = _require_metric_projected_crs(_read_prj_crs(administrative_boundary_shp), 'study-area CRS')
     dem_model = DEMTerrainModel(_DEM_TIF, target_crs)
     depot_xy_all = np.asarray([[row[1], row[2]] for row in generated_depot_data], dtype=float)
     depot_ground_all = dem_model.sample_many(depot_xy_all)
     valid_depot_mask = np.isfinite(depot_ground_all)
     dropped_depots = int((~valid_depot_mask).sum())
     if dropped_depots:
-        print(f'[起点DEM无效] 排除{dropped_depots}个起点（DEM外或NODATA）。')
+        print(f'[invalid depot DEM] dropped {dropped_depots} depots (outside DEM or NODATA).')
     generated_depot_data = [row for row, keep in zip(generated_depot_data, valid_depot_mask) if keep]
     depot_ground = depot_ground_all[valid_depot_mask]
     if not generated_depot_data:
-        raise ValueError('全部候选起点均无有效DEM高程，无法构建问题。')
+        raise ValueError('no candidate depot has a valid DEM elevation; cannot build the instance.')
     generated_depot_data = [[float(i), *row[1:]] for i, row in enumerate(generated_depot_data)]
     depot_xy = np.asarray([[row[1], row[2]] for row in generated_depot_data], dtype=float)
     depot_height = depot_ground + CLRP_DEPOT_HEIGHT_AGL
@@ -889,13 +889,13 @@ def load_zunhua_UAV_data_for_CLRP(administrative_boundary_shp=_ADMIN_BOUNDARY_SH
             if reason is not None:
                 reason_counter[reason] = reason_counter.get(reason, 0) + 1
                 details.append({'original_waypoint_id': int(row[0]), 'x': x, 'y': y, 'reason': reason, 'block_id': block_id})
-        _save_matrix_checkpoint('visibility_AB', visibility_key, arrays={'visibility_all': visibility_all.astype(np.uint8), 'keep_customer_indices': np.asarray(keep_customer_indices, dtype=np.int64)}, metadata={'details': details, 'reason_counter': reason_counter, 'shape': [len(generated_depot_data), len(customer_data)], 'description': 'A×B起点—原始途径点通视矩阵及可达途径点索引'})
+        _save_matrix_checkpoint('visibility_AB', visibility_key, arrays={'visibility_all': visibility_all.astype(np.uint8), 'keep_customer_indices': np.asarray(keep_customer_indices, dtype=np.int64)}, metadata={'details': details, 'reason_counter': reason_counter, 'shape': [len(generated_depot_data), len(customer_data)], 'description': 'A×B depot–raw-waypoint visibility matrix and reachable waypoint indices'})
     customer_data = [customer_data[i] for i in keep_customer_indices]
     customer_data = [[float(i), *row[1:]] for i, row in enumerate(customer_data)]
     customer_ground = customer_ground_all[keep_customer_indices]
     visibility = visibility_all[:, keep_customer_indices]
     if not customer_data:
-        raise ValueError('所有途径点均因DEM或通视约束不可达，无法构建求解实例。')
+        raise ValueError('all waypoints are unreachable under DEM or line-of-sight constraints; cannot build the instance.')
     global _LAST_UNPLANNABLE_WAYPOINTS, _LAST_PARTITION_UNPLANNABLE_WAYPOINTS
     global _LAST_UNPLANNABLE_DETAILS, _LAST_NODE_GROUND_ELEVATIONS
     global _LAST_NODE_FLIGHT_HEIGHTS, _LAST_DEPOT_WAYPOINT_VISIBILITY
@@ -903,12 +903,12 @@ def load_zunhua_UAV_data_for_CLRP(administrative_boundary_shp=_ADMIN_BOUNDARY_SH
     _LAST_UNPLANNABLE_WAYPOINTS = [(item['x'], item['y']) for item in details if item['reason'] != 'NO_DEPOT_IN_BLOCK']
     _LAST_PARTITION_UNPLANNABLE_WAYPOINTS = [(item['x'], item['y']) for item in details if item['reason'] == 'NO_DEPOT_IN_BLOCK']
     if reason_counter:
-        reason_text = '；'.join((f'{key}={value}' for key, value in sorted(reason_counter.items())))
-        print(f'[不可达途径点] 共排除{len(details)}个：{reason_text}')
+        reason_text = '; '.join((f'{key}={value}' for key, value in sorted(reason_counter.items())))
+        print(f'[unreachable waypoints] dropped {len(details)}: {reason_text}')
         for item in details[:20]:
-            print(f"  途径点{item['original_waypoint_id']} ({item['x']:.2f}, {item['y']:.2f})：{item['reason']}")
+            print(f"  waypoint {item['original_waypoint_id']} ({item['x']:.2f}, {item['y']:.2f}): {item['reason']}")
         if len(details) > 20:
-            print(f'  ……其余{len(details) - 20}个详见不可达途径点CSV。')
+            print(f'  ... remaining {len(details) - 20} listed in the unreachable-waypoint CSV.')
     result = _build_clrp_arrays(customer_data, generated_depot_data, n_selected_depots, max_vehicles_per_depot, vehicle_cap, penalize_long_edges=False)
     n_depots, _, n_customers = result[:3]
     _LAST_NODE_GROUND_ELEVATIONS = np.r_[depot_ground, customer_ground]
@@ -917,29 +917,29 @@ def load_zunhua_UAV_data_for_CLRP(administrative_boundary_shp=_ADMIN_BOUNDARY_SH
     full_visibility[:n_depots, n_depots:] = visibility
     full_visibility[n_depots:, :n_depots] = visibility.T
     _LAST_DEPOT_WAYPOINT_VISIBILITY = full_visibility
-    print('=== 遵化UAV数据集加载完成 ===')
-    print(f'起点集候选起降点数量：{result[0]}')
-    print(f'DEM与通视筛选后途径点数量：{result[2]}')
-    print(f'起点高度：DEM+{CLRP_DEPOT_HEIGHT_AGL:g}m；途径点高度：DEM+{CLRP_WAYPOINT_HEIGHT_AGL:g}m；通视限距：{CLRP_MAX_VISIBILITY_DISTANCE / 1000:g}km')
-    print(f'每个配送中心最大车辆数：{result[3]}')
-    print(f'车辆容量：{result[4]}')
-    print(f'总客户需求：{sum(result[10]):.0f}')
+    print('=== Zunhua UAV dataset loaded ===')
+    print(f'candidate take-off/landing sites: {result[0]}')
+    print(f'waypoints remaining after DEM and line-of-sight filtering: {result[2]}')
+    print(f'depot height: DEM+{CLRP_DEPOT_HEIGHT_AGL:g} m; waypoint height: DEM+{CLRP_WAYPOINT_HEIGHT_AGL:g} m; LOS range: {CLRP_MAX_VISIBILITY_DISTANCE / 1000:g} km')
+    print(f'max vehicles per depot: {result[3]}')
+    print(f'vehicle capacity: {result[4]}')
+    print(f'total customer demand: {sum(result[10]):.0f}')
     return result
 
 def load_prohibited_flight_areas(shp_path):
-    print('=== 加载禁飞区数据 ===')
+    print('=== Loading no-fly-zone data ===')
     if shp_path is None or not str(shp_path).strip():
-        print('未提供禁飞区路径：按无禁飞区处理，全域可飞。\n')
+        print('no no-fly shapefile provided: treat the whole area as flyable.\n')
         return []
     shp_path = os.fspath(shp_path)
-    print(f'禁飞区文件路径：{shp_path}')
+    print(f'no-fly shapefile: {shp_path}')
     if not os.path.exists(shp_path):
-        raise FileNotFoundError(f'禁飞区文件不存在：{shp_path}。若不使用禁飞区，请传入 None 或空字符串。')
+        raise FileNotFoundError(f'no-fly shapefile does not exist: {shp_path}. Pass None or an empty string to disable no-fly zones.')
     sf = shapefile.Reader(shp_path)
     source_prj = os.path.splitext(shp_path)[0] + '.prj'
     target_prj = os.path.splitext(_ADMIN_BOUNDARY_SHP)[0] + '.prj'
     if not os.path.exists(source_prj) or not os.path.exists(target_prj):
-        raise FileNotFoundError('禁飞区或行政区边界缺少 .prj 坐标系文件')
+        raise FileNotFoundError('no-fly or administrative boundary is missing a .prj CRS file')
     source_crs = CRS.from_wkt(open(source_prj, encoding='utf-8-sig').read())
     target_crs = CRS.from_wkt(open(target_prj, encoding='utf-8-sig').read())
     transformer = Transformer.from_crs(source_crs, target_crs, always_xy=True)
@@ -960,14 +960,14 @@ def load_prohibited_flight_areas(shp_path):
             if not poly.is_empty:
                 polygons.append(poly)
         if i % 1000 == 0 and i > 0:
-            print(f'  已处理 {i} 条铁路要素...')
+            print(f'  processed {i} railway features...')
     if is_railway and polygons:
         merged_railway_buffer = unary_union(polygons)
         if not merged_railway_buffer.is_valid:
             merged_railway_buffer = merged_railway_buffer.buffer(0)
         polygons = list(_iter_polygonal_parts(merged_railway_buffer))
-    label = f'铁路两侧各{CLRP_RAILWAY_BUFFER_DISTANCE:g} m缓冲禁飞区' if is_railway else '禁飞区'
-    print(f'共加载{len(polygons)}个{label}\n')
+    label = f'railway buffer no-fly zone ({CLRP_RAILWAY_BUFFER_DISTANCE:g} m on each side)' if is_railway else 'no-fly zone'
+    print(f'loaded {len(polygons)} {label} polygon(s)\n')
     return polygons
 
 def load_administrative_boundaries(shp_path):
@@ -983,18 +983,18 @@ def load_administrative_boundaries(shp_path):
         for start, end in zip(part_starts[:-1], part_starts[1:]):
             if end - start >= 2:
                 boundary_parts.append(points[start:end])
-    print(f'行政区边界：{os.path.basename(shp_path)}，共{len(boundary_parts)}段')
+    print(f'administrative boundary: {os.path.basename(shp_path)}, {len(boundary_parts)} part(s)')
     return boundary_parts
 
 def build_no_fly_crossing_matrix(all_nodes, coords, prohibited_polygons):
     n = len(all_nodes)
     crossing = np.zeros((n, n), dtype=bool)
     if not prohibited_polygons:
-        print(f'=== 无禁飞区：跳过 {n}×{n} 穿越矩阵计算，全域可飞 ===\n')
+        print(f'=== no no-fly zone: skip {n}×{n} crossing matrix, whole area flyable ===\n')
         return crossing
     n_prohibited = 0
     n_total = 0
-    print(f'=== 预计算禁飞区穿越矩阵 ({n}×{n} 节点对) ===')
+    print(f'=== Precomputing no-fly crossing matrix ({n}×{n} node pairs) ===')
     no_fly_tree = STRtree(prohibited_polygons)
     for i in range(n):
         for j in range(i + 1, n):
@@ -1008,9 +1008,9 @@ def build_no_fly_crossing_matrix(all_nodes, coords, prohibited_polygons):
                     n_prohibited += 1
                     break
         if i % 100 == 0 and i > 0:
-            print(f'  已处理 {i}/{n} 个节点...')
+            print(f'  processed {i}/{n} nodes...')
     pct = n_prohibited / max(n_total, 1) * 100
-    print(f'穿越禁飞区的边：{n_prohibited}/{n_total} ({pct:.1f}%)\n')
+    print(f'edges crossing a no-fly zone: {n_prohibited}/{n_total} ({pct:.1f}%)\n')
     return crossing
 
 class ALNS_CLRP:
@@ -1024,7 +1024,7 @@ class ALNS_CLRP:
         self.demands = demands
         self.vehicle_cap = vehicle_cap
         self.dist_matrix = dist_matrix
-        # 兼容既有调用接口；开放起点数量不再由上下限参数约束。
+        # Keep the existing call interface; open-depot count is no longer bounded by min/max parameters.
         self.n_selected_depots = n_selected_depots
         self.max_veh_per_depot = max_vehicles_per_depot
         self.max_route_length = max_route_length
@@ -1046,7 +1046,7 @@ class ALNS_CLRP:
                     self.actual_dist[i][j] = max(np.linalg.norm(coords[i] - coords[j]), 0.1)
         has_directional_matrices = all((matrix is not None for matrix in (self.ascent_distances, self.horizontal_distances, self.descent_distances)))
         if has_directional_matrices:
-            # 总距离始终由三个方向性分量按唯一的float32运算顺序重构。
+            # Total distance is always rebuilt from the three directed components in one float32 order.
             self.actual_dist = _compose_total_flight_distance(
                 self.ascent_distances,
                 self.horizontal_distances,
@@ -1064,17 +1064,17 @@ class ALNS_CLRP:
             report = _distance_matrix_consistency_report(supplied_total, self.actual_dist)
             if report.get('shape_mismatch'):
                 raise ValueError(
-                    'navigation_distances形状与节点矩阵不一致：'
-                    f"输入={report['supplied_shape']}，重构={report['rebuilt_shape']}"
+                    'navigation_distances shape does not match the node matrix: '
+                    f"supplied={report['supplied_shape']}, rebuilt={report['rebuilt_shape']}"
                 )
             if has_directional_matrices and not report['consistent']:
                 raise ValueError(
-                    '总距离矩阵与上升+平飞+下降矩阵存在实质性不一致：'
-                    f"有限性模式异常={report['finite_pattern_mismatch']}，"
-                    f"超容差元素={report['mismatch_count']}，"
-                    f"最大误差={report['max_difference']:.9f} m，"
-                    f"平均误差={report['mean_difference']:.9f} m，"
-                    f"rtol={CLRP_DISTANCE_MATRIX_CHECK_RTOL:g}，"
+                    'total distance matrix is materially inconsistent with ascent+horizontal+descent: '
+                    f"finite-pattern mismatch={report['finite_pattern_mismatch']}, "
+                    f"out-of-tolerance entries={report['mismatch_count']}, "
+                    f"max error={report['max_difference']:.9f} m, "
+                    f"mean error={report['mean_difference']:.9f} m, "
+                    f"rtol={CLRP_DISTANCE_MATRIX_CHECK_RTOL:g}, "
                     f"atol={CLRP_DISTANCE_MATRIX_CHECK_ATOL:g} m"
                 )
             self.no_fly_crossing = np.zeros_like(self.no_fly_crossing, dtype=bool)
@@ -1084,10 +1084,10 @@ class ALNS_CLRP:
         self._depot_position = {d: idx for idx, d in enumerate(self.depot_candidates)}
         self._customer_position = {c: idx for idx, c in enumerate(self.customers)}
         self._initial_service_cost = np.full((len(self.depot_candidates), len(self.customers)), np.inf, dtype=np.float32)
-        # 每个求解器接收的是单个自由飞行分块的局部问题，节点无需再次执行 O(n²) 连通性扫描。
+        # Each solver receives one free-flight block, so nodes do not need another O(n²) connectivity scan.
         self.node_component = {node: 0 for node in self.all_nodes}
 
-        # 起降点—拍摄点服务可行性采用矩阵运算，替代数百万次 Python 双重循环。
+        # Depot–waypoint service feasibility uses matrix operations instead of millions of Python nested loops.
         depot_index = np.asarray(self.depot_candidates, dtype=int)
         customer_index = np.asarray(self.customers, dtype=int)
         service_mask = self.visibility_matrix[np.ix_(depot_index, customer_index)].copy()
@@ -1106,7 +1106,7 @@ class ALNS_CLRP:
         for cust in self.customers:
             feasible = [d for d in self.depot_candidates if cust in self.direct_gateway_customers[d]]
             if not feasible:
-                raise ValueError(f'客户{cust}无法由任何候选配送中心在当前绕行距离下完成{self.max_route_length / 1000:g} km以内的往返服务；该实例在当前约束下不可行。')
+                raise ValueError(f'customer {cust} cannot be served round-trip within {self.max_route_length / 1000:g} km from any candidate depot under the current detour distances; the instance is infeasible.')
             self.customer_feasible_depots[cust] = tuple(feasible)
             cust_pos = self._customer_position[cust]
             for depot in feasible:
@@ -1166,36 +1166,36 @@ class ALNS_CLRP:
         visits = {cust: 0 for cust in self.customers}
         for depot, routes in routes_dict.items():
             if depot not in self.depot_candidates:
-                violations.append(f'节点{depot}不是配送中心候选点')
+                violations.append(f'node {depot} is not a candidate depot')
             if len(routes) > self.max_veh_per_depot:
-                violations.append(f'配送中心{depot}使用车辆数={len(routes)}，上限={self.max_veh_per_depot}')
+                violations.append(f'depot {depot} uses {len(routes)} vehicles, limit={self.max_veh_per_depot}')
             for route_idx, route in enumerate(routes):
-                route_name = f'配送中心{depot}路径{route_idx + 1}'
+                route_name = f'depot {depot} route {route_idx + 1}'
                 if len(route) < 3 or route[0] != depot or route[-1] != depot:
-                    violations.append(f'{route_name}未从所属配送中心出发并返回')
+                    violations.append(f'{route_name}does not start and end at its assigned depot')
                     continue
                 if not self.check_route_capacity(route):
-                    violations.append(f'{route_name}超过车辆容量')
+                    violations.append(f'{route_name}exceeds vehicle capacity')
                 if not self.check_route_length(route):
-                    violations.append(f'{route_name}超过最大航程')
+                    violations.append(f'{route_name}exceeds maximum route length')
                 if not self.check_route_visibility(route, depot):
                     invisible = [node for node in route[1:-1] if node in self.customers and (not self.can_depot_serve_customer(depot, node))]
-                    violations.append(f'{route_name}包含{len(invisible)}个与起点不通视的途径点：{invisible[:10]}')
+                    violations.append(f'{route_name}contains {len(invisible)} waypoint(s) without line of sight to the depot: {invisible[:10]}')
                 for a, b in zip(route[:-1], route[1:]):
                     if self.edge_crosses_no_fly(a, b):
-                        violations.append(f'{route_name}的航段({a},{b})穿越禁飞区')
+                        violations.append(f'{route_name} leg ({a},{b}) crosses a no-fly zone')
                 for node in route[1:-1]:
                     if node in visits:
                         visits[node] += 1
                     else:
-                        violations.append(f'{route_name}包含非法客户节点{node}')
+                        violations.append(f'{route_name}contains illegal customer node {node}')
         if require_all_customers:
             missing = [cust for cust, count in visits.items() if count == 0]
             duplicate = [cust for cust, count in visits.items() if count > 1]
             if missing:
-                violations.append(f'存在{len(missing)}个未服务客户')
+                violations.append(f'{len(missing)} customer(s) are unserved')
             if duplicate:
-                violations.append(f'存在{len(duplicate)}个重复服务客户')
+                violations.append(f'{len(duplicate)} customer(s) are served more than once')
         return (not violations, violations)
 
     def _selected_depots_cover_all(self, selected_depots):
@@ -1258,7 +1258,7 @@ class ALNS_CLRP:
                 mean_cost = float(np.mean([self.dist_matrix[depot][c] for c in newly]))
                 scored.append((-len(newly), mean_cost, float(self.depot_build_cost[depot]), depot))
             if not scored:
-                raise ValueError(f'通视贪心选址仍有{len(uncovered)}个途径点无法覆盖')
+                raise ValueError(f'visibility-greedy siting still leaves {len(uncovered)} waypoint(s) uncovered')
             _, _, _, chosen = min(scored)
             selected.add(chosen)
             covered.update(self.depot_cover_sets[chosen])
@@ -1304,8 +1304,8 @@ class ALNS_CLRP:
                         candidates.append((delta, 1, depot, len(routes_dict[depot]), 1, candidate_route))
             if not candidates:
                 visible_depots = [depot for depot in selected if self.can_depot_serve_customer(depot, customer)]
-                reason = '所选起点中无通视起点' if not visible_depots else '通视起点均受航程、容量、车辆数或禁飞边约束'
-                return (None, f'途径点{customer}无法贪心插入：{reason}')
+                reason = 'no selected depot has line of sight' if not visible_depots else 'visible depots are all blocked by range, capacity, vehicle-count, or no-fly edges'
+                return (None, f'waypoint {customer} cannot be greedily inserted: {reason}')
             _, is_new_route, depot, route_idx, _, candidate_route = min(candidates)
             if is_new_route:
                 routes_dict[depot].append(candidate_route)
@@ -1313,15 +1313,15 @@ class ALNS_CLRP:
                 routes_dict[depot][route_idx] = candidate_route
         feasible, violations = self.validate_solution(routes_dict)
         if not feasible:
-            return (None, '；'.join(violations[:8]))
+            return (None, '; '.join(violations[:8]))
         return (routes_dict, None)
 
     def _construct_routes_for_customer_subset(self, selected_depots, customer_subset):
-        """只为给定途径点子集构造闭合路线，不要求覆盖分块内的其他途径点。"""
+        """Build closed routes only for a given waypoint subset; other waypoints in the block need not be covered."""
         selected = sorted(set(selected_depots))
         customers = sorted(set(customer_subset))
         if not selected or not customers:
-            return (None, '局部起点集或途径点集为空')
+            return (None, 'local depot set or waypoint set is empty')
         routes_dict = {depot: [] for depot in selected}
         customer_order = sorted(
             customers,
@@ -1362,14 +1362,14 @@ class ALNS_CLRP:
                         delta = self.calculate_route_cost(candidate_route) + CLRP_VEHICLE_FIXED_COST
                         candidates.append((delta, 1, depot, len(routes_dict[depot]), candidate_route))
             if not candidates:
-                return (None, f'局部途径点{customer}无法插入候选起点集合{selected}')
+                return (None, f'local waypoint {customer} cannot be inserted into candidate depot set {selected}')
             _, is_new_route, depot, route_idx, candidate_route = min(candidates)
             if is_new_route:
                 routes_dict[depot].append(candidate_route)
             else:
                 routes_dict[depot][route_idx] = candidate_route
 
-        # 仅对新构造的局部路线执行路线内2-opt/Or-opt；不触碰区域外路线。
+        # Run intra-route 2-opt/Or-opt only on newly built local routes; do not touch routes outside the region.
         for depot, depot_routes in routes_dict.items():
             optimized = []
             for route in depot_routes:
@@ -1384,17 +1384,17 @@ class ALNS_CLRP:
         visits = {customer: 0 for customer in customers}
         for depot, depot_routes in routes_dict.items():
             if not depot_routes:
-                return (None, f'候选起点{depot}未承担任何途径点，拒绝空起点方案')
+                return (None, f'candidate depot {depot} serves no waypoints; reject the empty-depot plan')
             if len(depot_routes) > self.max_veh_per_depot:
-                return (None, f'候选起点{depot}路线数超过上限')
+                return (None, f'candidate depot {depot} exceeds the route-count limit')
             for route in depot_routes:
                 if not self._route_is_feasible(route, depot):
-                    return (None, f'候选起点{depot}存在不可行局部路线')
+                    return (None, f'candidate depot {depot} has an infeasible local route')
                 for customer in route[1:-1]:
                     if customer in visits:
                         visits[customer] += 1
         if any(count != 1 for count in visits.values()):
-            return (None, '局部途径点未被恰好服务一次')
+            return (None, 'local waypoints are not served exactly once')
         return (routes_dict, None)
 
     @staticmethod
@@ -1486,7 +1486,7 @@ class ALNS_CLRP:
             compactness = max(float(np.linalg.norm(self.coords[a] - self.coords[b]))
                               for a, b in combinations(group, 2)) if len(group) > 1 else 0.0
             if mode in ('relocate_1_to_1', 'expand_1_to_2'):
-                # 分区内仅有一个开放起点时，优先处理覆盖规模较大的单起点分区。
+                # When a partition has only one open depot, prefer partitions with larger coverage first.
                 primary = -scores[group[0]]
             elif mode == 'relocate_2_to_2':
                 primary = -abs(scores[group[0]] - scores[group[1]])
@@ -1494,7 +1494,7 @@ class ALNS_CLRP:
                 primary = sum(scores[d] for d in group) / len(group)
             else:
                 primary = -sum(scores[d] for d in group) / len(group)
-            # primary越小越优；紧凑区域优先作为次级条件。
+            # smaller primary is better; compact regions are a secondary tie-break.
             ranked.append((primary, compactness, group, local_customers,
                            sum(counts[d] for d in group), sum(areas[d] for d in group)))
         ranked.sort(key=lambda item: (item[0], item[1], item[2]))
@@ -1622,7 +1622,7 @@ class ALNS_CLRP:
         elif mode == 'expand_3_to_4':
             target_size, disjoint = 4, False
         else:
-            raise ValueError(f'未知起点结构操作：{mode}')
+            raise ValueError(f'unknown depot-structure operator: {mode}')
         if min_relative_improvement is None:
             min_relative_improvement = (
                 CLRP_INITIAL_FACILITY_EXPAND_MIN_REL_IMPROVEMENT
@@ -1649,7 +1649,7 @@ class ALNS_CLRP:
     def _refine_initial_facility_structure(self, routes_dict):
         if (not CLRP_INITIAL_FACILITY_REFINEMENT) or _ablation_disable_facility_ops():
             return routes_dict
-        print('\n=== 初始解起点结构强化：1→1 / 1→2 / 2→2 / 3→2 / 3→4 ===')
+        print('\n=== Initial depot-structure refinement: 1→1 / 1→2 / 2→2 / 3→2 / 3→4 ===')
         current = deepcopy(routes_dict)
         current_cost = self.calculate_build_cost(current.keys()) + self.calculate_total_transport_cost(current)
         initial_cost = current_cost
@@ -1666,11 +1666,11 @@ class ALNS_CLRP:
             'expand_3_to_4',
         )
         mode_labels = {
-            'relocate_1_to_1': '单起点分区位置调整1→1',
-            'expand_1_to_2': '单起点分区扩展1→2',
-            'relocate_2_to_2': '位置调整2→2',
-            'reduce_3_to_2': '小区域合并3→2',
-            'expand_3_to_4': '大区域扩展3→4',
+            'relocate_1_to_1': 'single-depot relocate 1→1',
+            'expand_1_to_2': 'single-depot expand 1→2',
+            'relocate_2_to_2': 'relocate 2→2',
+            'reduce_3_to_2': 'small-region merge 3→2',
+            'expand_3_to_4': 'large-region expand 3→4',
         }
         self.initial_facility_refinement_history = []
         while (no_improve_passes < CLRP_INITIAL_FACILITY_NO_IMPROVE_LIMIT
@@ -1706,42 +1706,42 @@ class ALNS_CLRP:
                 }
                 self.initial_facility_refinement_history.append(record)
                 improvement_pct = 100.0 * (old_cost - current_cost) / max(abs(old_cost), 1e-12)
-                print(f"[初始起点强化] {mode_labels[mode]}：{result['old_group']} → {result['replacement']}；"
-                      f"Cost {old_cost:.2f} → {current_cost:.2f}，降低{old_cost - current_cost:.2f} "
-                      f"({improvement_pct:.2f}%)；开放起点={len(current)}")
+                print(f"[initial depot refine] {mode_labels[mode]}: {result['old_group']} → {result['replacement']}; "
+                      f"Cost {old_cost:.2f} → {current_cost:.2f}, reduction {old_cost - current_cost:.2f} "
+                      f"({improvement_pct:.2f}%); open depots={len(current)}")
             if improved_this_pass:
                 no_improve_passes = 0
             else:
                 no_improve_passes += 1
-                print(f'[初始起点强化] 第{pass_index}轮无改进，连续无改进={no_improve_passes}/'
+                print(f'[initial depot refine] pass {pass_index} with no improvement, consecutive={no_improve_passes}/'
                       f'{CLRP_INITIAL_FACILITY_NO_IMPROVE_LIMIT}')
         feasible, violations = self.validate_solution(current)
         if not feasible:
-            raise ValueError('初始起点结构强化产生不可行解：' + '；'.join(violations[:8]))
-        print(f'初始起点结构强化完成：接受{accepted_moves}次；开放起点 {initial_depots} → {len(current)}；'
-              f'总成本 {initial_cost:.2f} → {current_cost:.2f}，降低{initial_cost - current_cost:.2f}。')
+            raise ValueError('initial depot-structure refinement produced an infeasible solution: ' + '; '.join(violations[:8]))
+        print(f'initial depot-structure refinement done: accepted {accepted_moves} move(s); open depots {initial_depots} → {len(current)}; '
+              f'total cost {initial_cost:.2f} → {current_cost:.2f}, reduction {initial_cost - current_cost:.2f}.')
         return current
 
     def initial_solution(self):
-        print('\n=== 生成通视矩阵贪心初始解 ===')
+        print('\n=== Building visibility-greedy initial solution ===')
         selected = self._construct_visibility_greedy_depots()
-        print(f'通视贪心选中起点：{sorted(selected)}（{len(selected)}个）')
+        print(f'visibility-greedy selected depots: {sorted(selected)} ({len(selected)})')
         routes, failure = self._construct_visibility_greedy_routes(selected)
         if routes is None:
-            raise ValueError(f'通视矩阵贪心初始解构造失败：{failure}')
+            raise ValueError(f'visibility-greedy initial solution failed: {failure}')
         feasible, violations = self.validate_solution(routes)
         if not feasible:
-            raise ValueError('通视矩阵贪心初始解不满足硬约束：' + '；'.join(violations[:8]))
+            raise ValueError('visibility-greedy initial solution violates hard constraints: ' + '; '.join(violations[:8]))
         routes = self._refine_initial_facility_structure(routes)
         self.selected_depots = list(routes)
         self.best_build_cost = self.calculate_build_cost(self.selected_depots)
         self.best_transport_cost = self.calculate_total_transport_cost(routes)
         self.best_total_cost = self.best_build_cost + self.best_transport_cost
         self.best_routes = deepcopy(routes)
-        print('通视贪心路线经起点结构强化后，作为ALNS初始解。')
-        print(f'初始建设成本：{self.best_build_cost:.2f}')
-        print(f'初始运输成本：{self.best_transport_cost:.2f}')
-        print(f'初始总成本：{self.best_total_cost:.2f}')
+        print('Visibility-greedy routes after depot-structure refinement become the ALNS initial solution.')
+        print(f'initial construction cost: {self.best_build_cost:.2f}')
+        print(f'initial transport cost: {self.best_transport_cost:.2f}')
+        print(f'initial total cost: {self.best_total_cost:.2f}')
         return routes
 
     def _two_opt_route(self, route):
@@ -1779,7 +1779,7 @@ class AdaptiveALNS_CLRP(ALNS_CLRP):
         self.max_destroy_rate = float(max_destroy_rate)
         self.max_destroy_customers = None if max_destroy_customers is None else max(1, int(max_destroy_customers))
         if not 0.0 < self.min_destroy_rate <= self.max_destroy_rate <= 1.0:
-            raise ValueError('破坏率必须满足 0 < min_destroy_rate <= max_destroy_rate <= 1')
+            raise ValueError('destroy rates must satisfy 0 < min_destroy_rate <= max_destroy_rate <= 1')
         self.destroy_operators = {
             'random': self._destroy_random,
             'worst': self._destroy_worst,
@@ -1962,10 +1962,10 @@ class AdaptiveALNS_CLRP(ALNS_CLRP):
         return self._remove_customers(routes_dict, [cust for _, cust in ordered[:q]])
 
     def _destroy_facility_structure(self, routes_dict, mode):
-        """用完整局部重构产生真正改变起点结构的ALNS候选解。
+        """Produce an ALNS candidate that truly changes depot structure via a full local rebuild.
 
-        该类算子不再执行旧的“关闭1个再开放1个”简单换位；候选解只有在
-        当前分块总成本严格下降超过CLRP_ALNS_FACILITY_MIN_REL_IMPROVEMENT时才返回。
+        These operators no longer do the old close-one/open-one swap; a candidate is returned only if
+        the current block cost falls by more than CLRP_ALNS_FACILITY_MIN_REL_IMPROVEMENT.
         """
         area_cache = {}
         ranked_groups = self._rank_initial_facility_groups(routes_dict, mode, area_cache)
@@ -1988,7 +1988,7 @@ class AdaptiveALNS_CLRP(ALNS_CLRP):
             'replacement': list(result['replacement']),
             'improvement_ratio': float(result['improvement_ratio']),
         }
-        # 已经是完整、通过全局约束验证的候选解；removed=[]时修复算子仅做最终验证。
+        # The candidate is already complete and globally feasible; when removed=[] the repair operator only validates.
         return (deepcopy(result['routes']), [])
 
     def _destroy_facility_relocate_2_to_2(self, routes_dict, destroy_rate):
@@ -2222,7 +2222,7 @@ class AdaptiveALNS_CLRP(ALNS_CLRP):
         return False
 
     def _local_search_intra_routes(self, routes_dict, max_rounds=4):
-        # max_rounds=0 是严格的 VND 消融：不执行任何路径层算子或终局抛光。
+        # max_rounds=0 is a strict VND ablation: no route-level operators or terminal polish.
         if int(max_rounds) <= 0:
             return deepcopy(routes_dict)
         routes = deepcopy(routes_dict)
@@ -2245,7 +2245,7 @@ class AdaptiveALNS_CLRP(ALNS_CLRP):
         return routes if feasible else deepcopy(routes_dict)
 
     def _vnd_rounds_for_candidate(self, candidate_cost, current_cost, iteration):
-        """按候选潜力分配 VND 预算；关闭自适应时严格复现旧触发规则。"""
+        """Allocate VND budget by candidate potential; with adaptive mode off, reproduce the old trigger rule exactly."""
         fixed_rounds = max(0, int(globals().get('CLRP_VND_MAX_ROUNDS', 4)))
         if fixed_rounds <= 0:
             return 0
@@ -2255,7 +2255,7 @@ class AdaptiveALNS_CLRP(ALNS_CLRP):
         elite = max(light, int(globals().get('CLRP_VND_ELITE_MAX_ROUNDS', fixed_rounds)))
         gap = max(0.0, float(globals().get('CLRP_VND_ELITE_GAP_RATIO', 0.003)))
         periodic = max(1, int(globals().get('CLRP_VND_PERIODIC_INTERVAL', 100)))
-        # 与历史最优相差不超过 gap 的候选值得深度打磨；严格刷新最优也包含在内。
+        # Candidates within the gap of the historic best deserve a deep polish; strict new bests are included.
         if candidate_cost <= self.best_total_cost * (1.0 + gap):
             return elite
         if candidate_cost < current_cost or iteration % periodic == 0:
@@ -2299,7 +2299,7 @@ def _prepare_resume_history(path, fields, completed_iteration):
 
 
 def _is_significant_best_improvement(candidate_cost, best_cost, min_rel=None):
-    """候选解相对历史最优的改进是否超过最小相对阈值（默认 0.01%）。"""
+    """Whether the candidate improves the historic best by more than the minimum relative threshold (default 0.01%)."""
     threshold = CLRP_BEST_MIN_REL_IMPROVEMENT if min_rel is None else float(min_rel)
     best = float(best_cost)
     cand = float(candidate_cost)
@@ -2322,14 +2322,14 @@ class ExperimentALNS_CLRP(AdaptiveALNS_CLRP):
 
     def alns_optimize(self, max_iter=CLRP_MAX_ITER, destroy_rate=CLRP_DESTROY_RATE, T_start=None, T_end=None, cooling_rate=None, start_worse_ratio=CLRP_T_START_WORSE_RATIO, start_accept_prob=CLRP_T_START_ACCEPT_PROB, end_cost_ratio=CLRP_T_END_COST_RATIO, history_csv_path=None, checkpoint_path=None, random_seed=CLRP_RANDOM_SEED, scenario_label='unspecified', print_interval=CLRP_CONSOLE_PROGRESS_INTERVAL, progress_callback=None):
         prefix = f'[{scenario_label} | seed={int(random_seed)}]'
-        print(f'\n{prefix} === 开始增强型自适应ALNS求解CLRP ===')
+        print(f'\n{prefix} === Starting enhanced adaptive ALNS for CLRP ===')
         run_start = time.time()
         elapsed_before = 0.0
         max_iter = max(1, int(max_iter))
         destroy_rate = float(destroy_rate)
         print_interval = max(0, int(print_interval))
         if not 0.0 < destroy_rate <= 1.0:
-            raise ValueError('destroy_rate 必须位于 (0, 1] 区间')
+            raise ValueError('destroy_rate must lie in (0, 1]')
         checkpoint_path = os.path.abspath(os.fspath(checkpoint_path)) if checkpoint_path else None
         run_signature = {
             'max_destroy_customers': CLRP_MAX_DESTROY_CUSTOMERS,
@@ -2354,9 +2354,9 @@ class ExperimentALNS_CLRP(AdaptiveALNS_CLRP):
                 if compatible:
                     checkpoint = candidate_state
                 else:
-                    print(f'{prefix} 检查点与当前任务不兼容，忽略：{checkpoint_path}')
+                    print(f'{prefix} checkpoint is incompatible with this job, ignoring: {checkpoint_path}')
             except Exception as exc:
-                print(f'{prefix} 检查点读取失败，重新开始：{exc}')
+                print(f'{prefix} checkpoint read failed, restarting: {exc}')
 
         if checkpoint is None:
             current_routes = self.initial_solution()
@@ -2365,22 +2365,22 @@ class ExperimentALNS_CLRP(AdaptiveALNS_CLRP):
             self._push_elite(current_routes, current_cost)
             if T_start is None:
                 if not 0.0 < start_accept_prob < 1.0:
-                    raise ValueError('start_accept_prob 必须位于 (0, 1) 区间')
+                    raise ValueError('start_accept_prob must lie in (0, 1)')
                 if start_worse_ratio <= 0.0:
-                    raise ValueError('start_worse_ratio 必须大于 0')
+                    raise ValueError('start_worse_ratio must be greater than 0')
                 T_start = max(1e-09, -(float(start_worse_ratio) * current_cost) / math.log(float(start_accept_prob)))
             if T_end is None:
                 if end_cost_ratio <= 0.0:
-                    raise ValueError('end_cost_ratio 必须大于 0')
+                    raise ValueError('end_cost_ratio must be greater than 0')
                 T_end = max(1e-09, float(end_cost_ratio) * current_cost)
             T_start, T_end = float(T_start), float(T_end)
             if T_start <= 0.0 or T_end <= 0.0 or T_end >= T_start:
-                raise ValueError('温度必须满足 T_start > T_end > 0')
+                raise ValueError('temperature must satisfy T_start > T_end > 0')
             if cooling_rate is None:
                 cooling_rate = (T_end / T_start) ** (1.0 / max_iter)
             cooling_rate = float(cooling_rate)
             if not 0.0 < cooling_rate < 1.0:
-                raise ValueError('cooling_rate 必须位于 (0, 1) 区间')
+                raise ValueError('cooling_rate must lie in (0, 1)')
             temperature = T_start
             no_improve = 0
             self._reset_segment_statistics()
@@ -2413,11 +2413,11 @@ class ExperimentALNS_CLRP(AdaptiveALNS_CLRP):
             elapsed_before = float(checkpoint.get('elapsed_seconds', 0.0))
             random.setstate(checkpoint['random_state'])
             np.random.set_state(checkpoint['numpy_random_state'])
-            print(f'{prefix} 已恢复检查点：完成 {last_completed_iteration}/{max_iter} 代，Best={self.best_total_cost:.2f}')
+            print(f'{prefix} restored checkpoint: finished {last_completed_iteration}/{max_iter} iterations, Best={self.best_total_cost:.2f}')
             if checkpoint.get('completed'):
                 feasible, violations = self.validate_solution(self.best_routes)
                 if not feasible:
-                    raise RuntimeError('已完成检查点未通过约束校验：' + '；'.join(violations))
+                    raise RuntimeError('completed checkpoint failed constraint validation: ' + '; '.join(violations))
                 self.history_csv_path = history_csv_path
                 return (self.selected_depots, self.best_routes, self.best_build_cost, self.best_transport_cost, self.best_total_cost, elapsed_before)
 
@@ -2456,9 +2456,9 @@ class ExperimentALNS_CLRP(AdaptiveALNS_CLRP):
                 history_writer.writeheader()
                 history_writer.writerow(self._history_row(scenario=scenario_label, seed=random_seed, iteration=0, phase='initial', current_cost=current_cost, candidate_cost=None, temperature=temperature, destroy_rate=None, destroy_operator=None, repair_operator=None, candidate_feasible=True, accepted=True, global_best_updated=False, reward=0.0, no_improve=no_improve, elapsed_seconds=elapsed_total()))
                 history_handle.flush()
-        print(f'{prefix} 最大迭代轮次：{max_iter}')
-        print(f'{prefix} 初始温度：{T_start:.6f}，终止温度：{T_end:.6f}，降温系数：{cooling_rate:.8f}')
-        print(f"{prefix} 断点文件：{checkpoint_path or '未启用'}")
+        print(f'{prefix} max iterations: {max_iter}')
+        print(f'{prefix} start temperature: {T_start:.6f}, end temperature: {T_end:.6f}, cooling rate: {cooling_rate:.8f}')
+        print(f"{prefix} resume file: {checkpoint_path or 'disabled'}")
         perf = {'destroy': 0.0, 'repair': 0.0, 'vnd': 0.0, 'cost_and_accept': 0.0, 'history_io': 0.0}
         flush_interval = max(1, int(globals().get('CLRP_HISTORY_FLUSH_INTERVAL', CLRP_ALNS_CHECKPOINT_INTERVAL)))
         save_checkpoint(False)
@@ -2541,11 +2541,11 @@ class ExperimentALNS_CLRP(AdaptiveALNS_CLRP):
                 if progress_callback is not None:
                     progress_callback(iteration, current_cost, self.best_total_cost)
                 if print_interval and (iteration == 1 or iteration % print_interval == 0):
-                    print(f'{prefix} 迭代{iteration}: Cur={current_cost:.2f} Best={self.best_total_cost:.2f} T={temperature:.3f} q={adaptive_rate:.2f} D={destroy_name} R={repair_name}')
+                    print(f'{prefix} iter {iteration}: Cur={current_cost:.2f} Best={self.best_total_cost:.2f} T={temperature:.3f} q={adaptive_rate:.2f} D={destroy_name} R={repair_name}')
             current_routes, current_cost = deepcopy(self.best_routes), self.best_total_cost
             feasible, violations = self.validate_solution(self.best_routes)
             if not feasible:
-                raise RuntimeError('增强型ALNS最终解未通过约束校验：' + '；'.join(violations))
+                raise RuntimeError('enhanced ALNS final solution failed constraint validation: ' + '; '.join(violations))
             save_checkpoint(True)
         except BaseException:
             save_checkpoint(False)
@@ -2558,12 +2558,12 @@ class ExperimentALNS_CLRP(AdaptiveALNS_CLRP):
         if globals().get('CLRP_PROFILE_ALNS_TIME', False):
             measured = sum(perf.values())
             other = max(0.0, time.time() - run_start - measured)
-            print(f"{prefix} 本次耗时分解：破坏={perf['destroy']:.2f}s，修复={perf['repair']:.2f}s，VND={perf['vnd']:.2f}s，成本/接受={perf['cost_and_accept']:.2f}s，CSV={perf['history_io']:.2f}s，其他={other:.2f}s")
-        print(f'{prefix} === 求解完成：Best={self.best_total_cost:.2f}，累计耗时={solve_time:.2f}s ===')
+            print(f"{prefix} time breakdown: destroy={perf['destroy']:.2f}s, repair={perf['repair']:.2f}s, VND={perf['vnd']:.2f}s, cost/accept={perf['cost_and_accept']:.2f}s, CSV={perf['history_io']:.2f}s, other={other:.2f}s")
+        print(f'{prefix} === solve finished: Best={self.best_total_cost:.2f}, elapsed={solve_time:.2f}s ===')
         return (self.selected_depots, self.best_routes, self.best_build_cost, self.best_transport_cost, self.best_total_cost, solve_time)
 
 def _setup_scientific_style():
-    # 英文统一 Times New Roman；三张解图文字整体放大。
+    # Use Times New Roman for English text; enlarge labels on the three solution figures.
     plt.rcParams.update({
         'font.family': 'serif',
         'font.serif': ['Times New Roman', 'Times', 'DejaVu Serif'],
@@ -2597,7 +2597,7 @@ def _setup_scientific_style():
 
 
 def _apply_times_new_roman(ax):
-    """将轴上标题、刻度与已有文本设为 Times New Roman。"""
+    """Set axis titles, ticks, and existing text to Times New Roman."""
     for artist in [ax.title, ax.xaxis.label, ax.yaxis.label]:
         if artist is not None:
             artist.set_fontname('Times New Roman')
@@ -2654,8 +2654,8 @@ def _add_lonlat_envelope(ax, administrative_boundaries, boundary_shp=_ADMIN_BOUN
     minx, miny = points.min(axis=0)
     maxx, maxy = points.max(axis=0)
     dx, dy = (maxx - minx, maxy - miny)
-    # 先留出图框与经纬度标注的白边，再在内侧绘制整饰框；
-    # 研究区轮廓因此位于规范矩形图框之内，而非紧贴图框边缘。
+    # Leave a white margin for the frame and lon/lat labels, then draw the neatline inside;
+    # the study-area outline then sits inside a regular rectangular frame instead of touching the edge.
     outer_pad_x, outer_pad_y = dx * 0.075, dy * 0.075
     frame_pad_x, frame_pad_y = dx * 0.030, dy * 0.030
     view_minx, view_miny = minx - outer_pad_x, miny - outer_pad_y
@@ -2668,8 +2668,8 @@ def _add_lonlat_envelope(ax, administrative_boundaries, boundary_shp=_ADMIN_BOUN
     corners = [(frame_minx, frame_miny), (frame_maxx, frame_miny), (frame_maxx, frame_maxy), (frame_minx, frame_maxy)]
     lonlat = [transformer.transform(x, y) for x, y in corners]
     from matplotlib.patches import Rectangle
-    # 论文地图常用的整饰线（neatline）：实线框配四角经纬度注记，
-    # 比虚线外包络框更清晰，也不会与研究区边界混淆。
+    # Map neatline used in the manuscript: a solid frame with lon/lat labels at the four corners,
+    # clearer than a dashed envelope and not confused with the study-area boundary.
     ax.set_xlim(view_minx, view_maxx)
     ax.set_ylim(view_miny, view_maxy)
     ax.add_patch(Rectangle((frame_minx, frame_miny), frame_maxx - frame_minx, frame_maxy - frame_miny, fill=False, edgecolor='#303030', linewidth=1.05, linestyle='-', zorder=10))
@@ -2682,7 +2682,7 @@ def _add_lonlat_envelope(ax, administrative_boundaries, boundary_shp=_ADMIN_BOUN
                     bbox=dict(facecolor='white', alpha=0.92, edgecolor='none', pad=0.6))
 
 def _add_prohibited_polygon_patches(ax, prohibited_polygons, facecolor='#d95f5f', edgecolor='#c54b4b', alpha=0.1, linewidth=0.65, linestyle='--', zorder=1):
-    """绘制禁飞区；保留 Polygon.interiors，避免铁路缓冲合并后的封闭空隙/环状空洞被涂成禁飞。"""
+    """Draw no-fly zones while keeping Polygon.interiors so holes left by railway-buffer unions are not filled as no-fly."""
     from matplotlib.path import Path
     from matplotlib.patches import PathPatch
     for geometry in prohibited_polygons or []:
@@ -2698,7 +2698,7 @@ def _add_prohibited_polygon_patches(ax, prohibited_polygons, facecolor='#d95f5f'
             ax.add_patch(PathPatch(path, facecolor=facecolor, edgecolor=edgecolor, alpha=alpha, linewidth=linewidth, linestyle=linestyle, zorder=zorder, label='_nolegend_'))
 
 def _solution_figure_paths(output_path):
-    """由单一输出路径派生地图 / 图例 / 路线长度三张独立图路径。"""
+    """Derive the map, legend, and route-length figure paths from a single output path."""
     output_path = os.path.abspath(os.fspath(output_path))
     directory = os.path.dirname(output_path)
     stem, ext = os.path.splitext(os.path.basename(output_path))
@@ -2725,7 +2725,7 @@ def _savefig_figure(fig, path, show_figure=False):
     return path
 
 def show_result_CLRP(customers, coords, depot_build_cost, selected_depots, best_routes, build_cost, transport_cost, total_cost, prohibited_polygons, administrative_boundaries, output_path=None, show_figure=False, scenario_label='', random_seed=None, unplannable_details=None, navigation_data=None, navigation_distances=None):
-    """分别输出三张独立图：空间地图、图例、路线长度汇总。"""
+    """Write three separate figures: spatial map, legend, and route-length summary."""
     _setup_scientific_style()
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
@@ -2749,7 +2749,7 @@ def show_result_CLRP(customers, coords, depot_build_cost, selected_depots, best_
     for item in unplannable_details or []:
         grouped.setdefault(item.get('reason', 'NO_VISIBLE_DEPOT'), []).append((item['x'], item['y']))
 
-    # ---------- 1) 地图（不含图例） ----------
+    # ---------- 1) map (no legend) ----------
     fig_map = plt.figure(figsize=(12.6, 10.8), constrained_layout=False)
     ax1 = fig_map.add_subplot(111)
     if administrative_boundaries:
@@ -2795,7 +2795,7 @@ def show_result_CLRP(customers, coords, depot_build_cost, selected_depots, best_
     fig_map.subplots_adjust(bottom=0.04, top=0.94, left=0.02, right=0.98)
     _savefig_figure(fig_map, paths['map'], show_figure=show_figure)
 
-    # ---------- 2) 独立图例 ----------
+    # ---------- 2) standalone legend ----------
     legend_handles = [
         Line2D([0], [0], color='#4c78a8', linewidth=1.2, marker='^', markersize=8,
                markerfacecolor='#4c78a8', markeredgecolor='white', markeredgewidth=0.6,
@@ -2832,7 +2832,7 @@ def show_result_CLRP(customers, coords, depot_build_cost, selected_depots, best_
     fig_leg.subplots_adjust(left=0.04, right=0.98, top=0.88, bottom=0.06)
     _savefig_figure(fig_leg, paths['legend'], show_figure=show_figure)
 
-    # ---------- 3) 路线长度汇总 ----------
+    # ---------- 3) route-length summary ----------
     depot_total_km = []
     depot_route_counts = []
     all_route_km = []
@@ -2876,7 +2876,7 @@ def show_result_CLRP(customers, coords, depot_build_cost, selected_depots, best_
         spine.set_color('#303030')
         spine.set_linewidth(0.9)
     max_total = max(ordered_totals) if ordered_totals else 1.0
-    # 为条末统计文字预留足够坐标空间，避免写出右侧黑色外框。
+    # Leave enough axis space for end-of-bar labels so they do not overflow the right spine.
     ax2.set_xlim(0, max_total * 1.72)
     for y, total, n_routes in zip(y_pos, ordered_totals, ordered_counts):
         ax2.text(total + max_total * 0.025, y, f'{total:.1f} km  |  {n_routes} routes',
@@ -2906,7 +2906,7 @@ class _BlockProgressBar:
         self.last = percent
         filled = int(24 * percent / 100)
         bar = '#' * filled + '-' * (24 - filled)
-        print(f'\r[进度|pid={self.pid}|seed={self.seed}|block={self.block_id + 1}] [{bar}] {percent:3d}% ({iteration}/{self.total}) Cur={current_cost:.2f} Best={best_cost:.2f}', end='', flush=True)
+        print(f'\r[progress|pid={self.pid}|seed={self.seed}|block={self.block_id + 1}] [{bar}] {percent:3d}% ({iteration}/{self.total}) Cur={current_cost:.2f} Best={best_cost:.2f}', end='', flush=True)
         if iteration >= self.total:
             self.finished = True
             print(flush=True)
@@ -2922,7 +2922,7 @@ def build_free_flight_blocks(coords, depot_candidates, customers, administrative
     free = boundary.difference(safe_forbidden) if not safe_forbidden.is_empty else boundary
     blocks = [p for p in _iter_polygonal_parts(free) if p.area > 1e-06]
     if not blocks:
-        raise ValueError('禁飞区安全缓冲后不存在自由飞行区域。')
+        raise ValueError('no free-flight area remains after applying the no-fly safety buffer.')
     node_block = np.full(len(coords), -1, dtype=int)
     for node in list(depot_candidates) + list(customers):
         point = Point(coords[node])
@@ -2937,8 +2937,8 @@ def build_free_flight_blocks(coords, depot_candidates, customers, administrative
         block_info.append({'block_id': block_id, 'geometry': block, 'depots': ds, 'customers': cs})
     bad = [item for item in block_info if item['customers'] and (not item['depots'])]
     if bad:
-        print('[禁飞区分块] ' + '；'.join((f"分块{item['block_id'] + 1}含{len(item['customers'])}个途径点但无候选起点" for item in bad)))
-    print('[禁飞区分块] ' + '；'.join((f"分块{item['block_id'] + 1}: 起点={len(item['depots'])}, 途径点={len(item['customers'])}" for item in block_info if item['customers'])))
+        print('[no-fly partition] ' + '; '.join((f"block {item['block_id'] + 1} has {len(item['customers'])} waypoint(s) but no candidate depot" for item in bad)))
+    print('[no-fly partition] ' + '; '.join((f"block {item['block_id'] + 1}: depots={len(item['depots'])}, waypoints={len(item['customers'])}" for item in block_info if item['customers'])))
     return (node_block, block_info)
 
 def _load_problem_once(no_fly_shp=_DEFAULT_NO_FLY_SHP, administrative_boundary_shp=None):
@@ -2965,7 +2965,7 @@ def _load_problem_once(no_fly_shp=_DEFAULT_NO_FLY_SHP, administrative_boundary_s
      vehicle_cap, depot_candidates, customers, all_nodes, coords, depot_build_cost,
      demands, base_dist_matrix) = data
 
-    # 先做自由飞行连通分块；不同分块节点对不参与同一条航线，无需建立绕行距离。
+    # Build free-flight connected blocks first; node pairs in different blocks never share a route, so detours are skipped.
     administrative_boundaries = load_administrative_boundaries(administrative_boundary_shp)
     node_block, block_info = build_free_flight_blocks(
         coords, depot_candidates, customers, administrative_boundary_shp,
@@ -3015,7 +3015,7 @@ def _load_problem_once(no_fly_shp=_DEFAULT_NO_FLY_SHP, administrative_boundary_s
             navigation_data,
             metadata={
                 'n_nodes': int(len(all_nodes)),
-                'description': '按自由飞行分块构建的二维禁飞区近切线绕行距离矩阵',
+                'description': '2D near-tangent no-fly detour distances built per free-flight block',
                 'navigation_config': navigation_config,
             },
         )
@@ -3054,18 +3054,18 @@ def _load_problem_once(no_fly_shp=_DEFAULT_NO_FLY_SHP, administrative_boundary_s
         descent_3d = cached_arrays['descent'].astype(np.float32, copy=False)
         cruise_heights = cached_arrays['cruise'].astype(np.float32, copy=False)
 
-        # 旧检查点中的total可能由“float64求和后转float32”生成。这里不再直接
-        # 使用它，而是以三个分量为唯一数据源重构总距离，消除运算路径差异。
+        # Older checkpoints may have stored total from float64-sum-then-cast. Do not reuse it;
+        # rebuild total from the three components as the only source of truth.
         dist_matrix = _compose_total_flight_distance(
             ascent_3d, horizontal_3d, descent_3d
         )
         cache_report = _distance_matrix_consistency_report(cached_total, dist_matrix)
         if not cache_report['consistent']:
             print(
-                '[飞行矩阵检查点] 已按上升+平飞+下降重新构造总距离矩阵；'
-                f"旧total最大差异={cache_report['max_difference']:.9f} m，"
-                f"超容差元素={cache_report['mismatch_count']}，"
-                f"有限性模式异常={cache_report['finite_pattern_mismatch']}。"
+                '[flight-matrix checkpoint] rebuilt total from ascent+horizontal+descent; '
+                f"old-total max difference={cache_report['max_difference']:.9f} m, "
+                f"out-of-tolerance entries={cache_report['mismatch_count']}, "
+                f"finite-pattern mismatch={cache_report['finite_pattern_mismatch']}."
             )
     else:
         dist_matrix = np.full((n_all, n_all), np.inf, dtype=np.float32)
@@ -3081,7 +3081,7 @@ def _load_problem_once(no_fly_shp=_DEFAULT_NO_FLY_SHP, administrative_boundary_s
         for order, block in enumerate(active_blocks, 1):
             block_nodes = list(block['depots']) + list(block['customers'])
             index = np.asarray(block_nodes, dtype=int)
-            print(f"[DEM三维矩阵] 分块{block['block_id'] + 1} ({order}/{len(active_blocks)})：节点数={len(index)}")
+            print(f"[DEM 3D matrix] block {block['block_id'] + 1} ({order}/{len(active_blocks)}): nodes={len(index)}")
             matrices = build_three_dimensional_flight_matrices(
                 np.asarray(coords)[index],
                 flight_heights[index],
@@ -3097,7 +3097,7 @@ def _load_problem_once(no_fly_shp=_DEFAULT_NO_FLY_SHP, administrative_boundary_s
                 matrices,
             ):
                 target[ix] = np.asarray(local, dtype=np.float32)
-        # 新计算的检查点同样以三个float32分量重构total，确保保存后严格同源。
+        # Newly computed checkpoints also rebuild total from the three float32 components so saved files stay consistent.
         dist_matrix = _compose_total_flight_distance(
             ascent_3d, horizontal_3d, descent_3d
         )
@@ -3115,7 +3115,7 @@ def _load_problem_once(no_fly_shp=_DEFAULT_NO_FLY_SHP, administrative_boundary_s
                 'n_nodes': int(n_all),
                 'n_depots': int(n_depot_candidates),
                 'n_waypoints': int(n_customers),
-                'description': '分块 float32 方向性三维飞行矩阵',
+                'description': 'block-wise float32 directed 3D flight matrices',
             },
         )
 
@@ -3164,7 +3164,7 @@ def _make_local_block_problem(problem, block):
     if not customers:
         return None
     if not depots:
-        raise ValueError(f"自由飞行块 {block['block_id'] + 1} 有途径点但没有候选起点")
+        raise ValueError(f"free-flight block {block['block_id'] + 1} has waypoints but no candidate depot")
     local_to_global = depots + customers
     index = np.asarray(local_to_global, dtype=int)
     matrix_index = np.ix_(index, index)
@@ -3203,9 +3203,9 @@ def plot_saved_solution(result_json, output_path=None, show_figure=False):
         stem = os.path.splitext(os.path.basename(result_json))[0].replace('_solution_result_', '_solution_')
         output_path = os.path.join(os.path.dirname(result_json), f'{stem}.png')
     image_paths = show_result_CLRP(problem['customers'], problem['coords'], problem['depot_build_cost'], selected, routes, float(result['build_cost']), float(result['transport_cost']), float(result['total_cost']), problem['prohibited_polygons'], problem['administrative_boundaries'], output_path=output_path, show_figure=show_figure, scenario_label=result.get('scenario', ''), random_seed=result.get('seed'), unplannable_details=problem['unplannable_details'], navigation_data=problem['navigation_data'], navigation_distances=problem['navigation_distances'])
-    print(f'已从保存结果重绘：地图={image_paths["map"]}')
-    print(f'已从保存结果重绘：图例={image_paths["legend"]}')
-    print(f'已从保存结果重绘：路线长度={image_paths["route_length"]}')
+    print(f'redrawn from saved result: map={image_paths["map"]}')
+    print(f'redrawn from saved result: legend={image_paths["legend"]}')
+    print(f'redrawn from saved result: route length={image_paths["route_length"]}')
     return image_paths
 
 def _run_single_seed_worker(payload):
@@ -3277,7 +3277,7 @@ def export_candidate_pool_csv(problem, output_dir):
         writer = csv.writer(f)
         writer.writerow(['candidate_id', 'x', 'y', 'build_cost', 'candidate_source'])
         for depot in problem['depot_candidates']:
-            writer.writerow([depot, f"{problem['coords'][depot][0]:.6f}", f"{problem['coords'][depot][1]:.6f}", f"{problem['depot_build_cost'][depot]:.6f}", 'FCLRP遵化数据/遵化随机起点集2000'])
+            writer.writerow([depot, f"{problem['coords'][depot][0]:.6f}", f"{problem['coords'][depot][1]:.6f}", f"{problem['depot_build_cost'][depot]:.6f}", 'FCLRP_Zunhua_data/zunhua_random_depots_2000'])
     return output_path
 
 def export_visibility_matrix_csv(problem, output_dir):
@@ -3314,7 +3314,7 @@ def export_flight_matrix_checkpoint(problem, output_dir):
     os.replace(output_path + '.tmp', output_path)
     manifest_path = os.path.join(output_dir, f'{_output_stem("flight_matrix_checkpoint_manifest")}.json')
     with open(manifest_path, 'w', encoding='utf-8') as file_obj:
-        json.dump({'checkpoint': output_path, 'direction_note': '上升和下降为有向矩阵；返航B→A不能直接复用A→B，因此额外保存BA。水平矩阵在正常情况下对称。', 'matrix_rule': 'total = ascent + horizontal + descent', 'depot_height_rule': f'DEM+{CLRP_DEPOT_HEIGHT_AGL:g}m', 'waypoint_height_rule': f'DEM+{CLRP_WAYPOINT_HEIGHT_AGL:g}m', 'terrain_clearance_rule': f'沿线DEM最高点+{CLRP_DEM_CLEARANCE:g}m', 'n_depots': int(len(depots)), 'n_waypoints': int(len(waypoints))}, file_obj, ensure_ascii=False, indent=2)
+        json.dump({'checkpoint': output_path, 'direction_note': 'Ascent and descent are directed; return legs B→A cannot reuse A→B, so BA is stored separately. The horizontal matrix is symmetric in the normal case.', 'matrix_rule': 'total = ascent + horizontal + descent', 'depot_height_rule': f'DEM+{CLRP_DEPOT_HEIGHT_AGL:g}m', 'waypoint_height_rule': f'DEM+{CLRP_WAYPOINT_HEIGHT_AGL:g}m', 'terrain_clearance_rule': f'highest DEM along the profile +{CLRP_DEM_CLEARANCE:g}m', 'n_depots': int(len(depots)), 'n_waypoints': int(len(waypoints))}, file_obj, ensure_ascii=False, indent=2)
     return output_path
 
 def export_node_elevations_csv(problem, output_dir):
@@ -3371,35 +3371,35 @@ def export_route_3d_segments_csv(problem, routes, output_path):
 def run_parallel_experiments(random_seeds=CLRP_PARALLEL_RANDOM_SEEDS, max_iter=CLRP_MAX_ITER, no_fly_shp=CLRP_EXPERIMENT_NO_FLY_SHP, administrative_boundary_shp=None, max_workers=CLRP_PARALLEL_MAX_WORKERS, output_root=None):
     seeds = [int(seed) for seed in random_seeds]
     if not seeds:
-        raise ValueError('random_seeds 不能为空')
+        raise ValueError('random_seeds must not be empty')
     if len(set(seeds)) != len(seeds):
-        raise ValueError('random_seeds 中存在重复种子')
+        raise ValueError('random_seeds contains duplicate seeds')
     problem = _load_problem_once(no_fly_shp, administrative_boundary_shp)
     scenario = problem['scenario_label']
     scenario_file = _sanitize_filename(scenario)
     output_root = os.path.abspath(output_root or os.path.join(_OUTPUT_DIR, _run_output_dirname(scenario, max_iter)))
     os.makedirs(output_root, exist_ok=True)
-    fixed_outputs = {'候选起点': export_candidate_pool_csv(problem, output_root), '通视矩阵': export_visibility_matrix_csv(problem, output_root), '飞行矩阵': export_flight_matrix_checkpoint(problem, output_root), '节点高度': export_node_elevations_csv(problem, output_root), '不可达点': export_unplannable_waypoints_csv(problem, output_root)}
+    fixed_outputs = {'candidate sites': export_candidate_pool_csv(problem, output_root), 'visibility matrix': export_visibility_matrix_csv(problem, output_root), 'flight matrix': export_flight_matrix_checkpoint(problem, output_root), 'node heights': export_node_elevations_csv(problem, output_root), 'unreachable points': export_unplannable_waypoints_csv(problem, output_root)}
     for label, path in fixed_outputs.items():
         if path:
-            print(f'{label}：{path}')
+            print(f'{label}: {path}')
     local_blocks = [local for local in (_make_local_block_problem(problem, block) for block in problem['free_flight_blocks']) if local is not None]
     if not local_blocks:
-        raise ValueError('没有包含途径点的自由飞行块')
+        raise ValueError('no free-flight block contains waypoints')
     task_count = len(seeds) * len(local_blocks)
     workers = max(1, min(int(max_workers), task_count, os.cpu_count() or 1))
-    print('\n=== 多随机种子并行实验 ===')
-    print(f'场景：{scenario}')
-    print(f'随机种子：{seeds}')
-    print(f'自由飞行块：{len(local_blocks)}；任务：{task_count}；进程：{workers}')
-    print(f'输出目录：{output_root}')
-    payloads = [{'problem': local_problem, 'seed': seed, 'max_iter': max_iter, 'output_dir': os.path.join(output_root, f'种子_{seed}')} for seed in seeds for local_problem in local_blocks]
+    print('\n=== Multi-seed parallel experiment ===')
+    print(f'scenario: {scenario}')
+    print(f'random seeds: {seeds}')
+    print(f'free-flight blocks: {len(local_blocks)}; tasks: {task_count}; workers: {workers}')
+    print(f'output directory: {output_root}')
+    payloads = [{'problem': local_problem, 'seed': seed, 'max_iter': max_iter, 'output_dir': os.path.join(output_root, f'seed_{seed}')} for seed in seeds for local_problem in local_blocks]
     block_summaries = []
     ctx = mp.get_context('spawn')
-    # 经 importlib 动态加载时，函数属于非标准模块名；spawn 子进程须先 initializer 注册该模块。
+    # When loaded via importlib the functions live in a non-standard module name; spawn workers must register it in an initializer.
     pool_kwargs = {}
     if __name__ != '__main__':
-        from lib_遵化实验公共 import collect_module_config_snapshot, multiprocess_worker_init
+        from lib_zunhua_experiment_common import collect_module_config_snapshot, multiprocess_worker_init
         pool_kwargs = {
             'initializer': multiprocess_worker_init,
             'initargs': (os.path.abspath(__file__), __name__, collect_module_config_snapshot(sys.modules[__name__])),
@@ -3411,15 +3411,15 @@ def run_parallel_experiments(random_seeds=CLRP_PARALLEL_RANDOM_SEEDS, max_iter=C
             try:
                 summary = future.result()
                 block_summaries.append(summary)
-                print(f"[完成] seed={seed}, block={block_id + 1}，Best={summary['best_total_cost']}，耗时={summary['solve_time_seconds']}s")
+                print(f"[done] seed={seed}, block={block_id + 1}, Best={summary['best_total_cost']}, time={summary['solve_time_seconds']}s")
             except Exception as exc:
                 block_summaries.append({'scenario': scenario, 'seed': seed, 'block_id': block_id, 'status': 'failed', 'error': ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))})
-                print(f'[失败] seed={seed}, block={block_id + 1}: {exc}')
+                print(f'[failed] seed={seed}, block={block_id + 1}: {exc}')
     seed_summaries = []
     for seed in seeds:
         rows = [row for row in block_summaries if row['seed'] == seed]
         if any((row.get('status') != 'success' for row in rows)):
-            seed_summaries.append({'scenario': scenario, 'seed': seed, 'status': 'failed', 'error': '至少一个自由飞行块求解失败'})
+            seed_summaries.append({'scenario': scenario, 'seed': seed, 'status': 'failed', 'error': 'at least one free-flight block failed to solve'})
             continue
         selected = sorted({depot for row in rows for depot in row['global_selected_depots']})
         routes = {}
@@ -3430,7 +3430,7 @@ def run_parallel_experiments(random_seeds=CLRP_PARALLEL_RANDOM_SEEDS, max_iter=C
         transport_cost = sum((float(row['transport_cost']) for row in rows))
         total_cost = build_cost + transport_cost
         solve_time = sum((float(row['solve_time_seconds']) for row in rows))
-        seed_dir = os.path.join(output_root, f'种子_{seed}')
+        seed_dir = os.path.join(output_root, f'seed_{seed}')
         os.makedirs(seed_dir, exist_ok=True)
         iteration_csvs = [row['iteration_csv'] for row in rows]
         block_result_files = [row['block_result_json'] for row in rows]
@@ -3438,17 +3438,17 @@ def run_parallel_experiments(random_seeds=CLRP_PARALLEL_RANDOM_SEEDS, max_iter=C
         _merge_iteration_csvs(rows, seed_iterations_csv)
         solution_result_json = os.path.join(seed_dir, f'{_output_stem("solution_result", scenario_file, f"seed_{seed}")}.json')
         save_solution_result(solution_result_json, selected, routes, build_cost, transport_cost, total_cost, scenario, seed, no_fly_shp=problem['no_fly_shp'], administrative_boundary_shp=problem['administrative_boundary_shp'], solve_time=solve_time, iteration_csvs=iteration_csvs, block_result_files=block_result_files)
-        print(f'[结果已保存] seed={seed}: {solution_result_json}')
+        print(f'[result saved] seed={seed}: {solution_result_json}')
         export_route_3d_segments_csv(problem, routes, os.path.join(seed_dir, f'{_output_stem("route_3d_segments", scenario_file, f"seed_{seed}")}.csv'))
         solution_png = os.path.join(seed_dir, f'{_output_stem("solution", scenario_file, f"seed_{seed}")}.png')
         plot_error = ''
         solution_paths = {}
         try:
             solution_paths = show_result_CLRP(problem['customers'], problem['coords'], problem['depot_build_cost'], selected, routes, build_cost, transport_cost, total_cost, problem['prohibited_polygons'], problem['administrative_boundaries'], output_path=solution_png, show_figure=False, scenario_label=scenario, random_seed=seed, unplannable_details=problem['unplannable_details'], navigation_data=problem['navigation_data'], navigation_distances=problem['navigation_distances'])
-            print(f'[出图完成] seed={seed}: map/legend/route_length')
+            print(f'[figures written] seed={seed}: map/legend/route_length')
         except Exception as exc:
             plot_error = f'{type(exc).__name__}: {exc}'
-            print(f'[绘图失败但结果已保存] seed={seed}: {plot_error}')
+            print(f'[plot failed but result saved] seed={seed}: {plot_error}')
         seed_summaries.append({'scenario': scenario, 'seed': seed, 'status': 'success', 'best_total_cost': f'{total_cost:.10f}', 'build_cost': f'{build_cost:.10f}', 'transport_cost': f'{transport_cost:.10f}', 'n_open_depots': len(selected), 'selected_depots': ';'.join(map(str, selected)), 'n_routes': sum((len(x) for x in routes.values())), 'solution_result_json': solution_result_json, 'solution_png': solution_paths.get('map', '') if not plot_error else '', 'solution_legend_png': solution_paths.get('legend', '') if not plot_error else '', 'solution_route_length_png': solution_paths.get('route_length', '') if not plot_error else '', 'plot_error': plot_error})
     block_summaries.sort(key=lambda row: (int(row['seed']), int(row.get('block_id', -1))))
     seed_summaries.sort(key=lambda row: int(row['seed']))
@@ -3464,12 +3464,12 @@ def run_parallel_experiments(random_seeds=CLRP_PARALLEL_RANDOM_SEEDS, max_iter=C
         costs = np.asarray([float(row['best_total_cost']) for row in successful])
         statistics_csv = os.path.join(output_root, f'{_output_stem("experiment_statistics", scenario_file)}.csv')
         _write_dict_rows(statistics_csv, [{'scenario': scenario, 'n_runs': len(successful), 'mean_best_total_cost': f'{costs.mean():.10f}', 'std_best_total_cost': f'{(costs.std(ddof=1) if len(costs) > 1 else 0.0):.10f}', 'min_best_total_cost': f'{costs.min():.10f}', 'max_best_total_cost': f'{costs.max():.10f}', 'best_seed': int(successful[int(np.argmin(costs))]['seed'])}])
-    print('\n=== 并行实验结束 ===')
-    print(f'分块汇总：{block_summary_csv}')
-    print(f'逐种子汇总：{summary_csv}')
-    print(f'全部逐代结果：{all_iterations_csv}')
+    print('\n=== Parallel experiment finished ===')
+    print(f'block summary: {block_summary_csv}')
+    print(f'per-seed summary: {summary_csv}')
+    print(f'all iteration logs: {all_iterations_csv}')
     if statistics_csv:
-        print(f'统计结果：{statistics_csv}')
+        print(f'statistics: {statistics_csv}')
     return seed_summaries
 if __name__ == '__main__':
     mp.freeze_support()

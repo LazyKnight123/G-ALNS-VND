@@ -1,11 +1,11 @@
-"""大规模禁飞区安全绕行距离与航迹恢复。
+"""Safe detour distances and path recovery for large no-fly zones.
 
-设计目标
+Design goals
 --------
-1. 保留“直线优先；受阻时采用近切线接入—安全边界绕行—近切线切出”的逻辑；
-2. 边界采样点只用于单航段绕行，不进入 ALNS 服务节点序列；
-4. 支持按自由飞行连通分块只计算可能使用的节点对；
-5. 对单一闭合禁飞边界使用累计弧长直接求边界最短路，不构造边界全距离矩阵。
+1. Keep straight-line first; if blocked, use near-tangent entry, safe-boundary detour, and near-tangent exit;
+2. Boundary samples are used only for a single-leg detour and never enter the ALNS service-node sequence;
+4. Compute only node pairs that can appear inside the same free-flight connected block;
+5. For a single closed no-fly ring, use cumulative arc length for the boundary shortest path instead of a full boundary distance matrix.
 """
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def _parts(geometry):
 
 
 def _blocked_mask(lines, safe_area):
-    """进入安全排斥区内部才判为阻挡；仅切触边界允许通过。"""
+    """A segment is blocked only if it enters the interior of the safety exclusion; touching the boundary is allowed."""
     intersects = shapely.intersects(lines, safe_area)
     touches = shapely.touches(lines, safe_area)
     return np.asarray(intersects & ~touches, dtype=bool)
@@ -49,15 +49,15 @@ def _line_is_clear(start_xy, end_xy, safe_area) -> bool:
 
 
 def _sample_ring_preserve_vertices(ring, max_segment_length: float):
-    """保留原边界全部顶点，并仅在原线段内部加密。
+    """Keep every original boundary vertex and densify only inside original segments.
 
-    相邻采样点始终落在同一条原始边界线段上，因此不会像等弧长插值后再连线
-    那样跨越拐点并切入安全区。
+    Adjacent samples always lie on the same original boundary segment, so they do not cut corners the way
+    equal-arc interpolation followed by reconnection can cut into the safety zone.
     """
     raw = np.asarray(ring.coords, dtype=float)
     if len(raw) < 4:
         return np.empty((0, 2), dtype=float)
-    raw = raw[:-1]  # 去掉闭合重复首点
+    raw = raw[:-1]  # drop the duplicated closing vertex
     step = max(float(max_segment_length), 0.5)
     sampled = []
     count = len(raw)
@@ -124,9 +124,9 @@ def _build_boundary_data(navigation_safe, requested_step: float, max_boundary_no
 
 
 def _angular_extrema_candidates(point_xy, boundary_xy, ring_ranges, neighbour_span: int = 2):
-    """用极角局部极值近似端点对边界的切点候选。
+    """Approximate tangent candidates from polar-angle local extrema of a terminal relative to the boundary.
 
-    该步骤只执行 NumPy 运算，不为端点到每个边界点创建 Shapely 线对象。
+    This step uses NumPy only and does not create a Shapely line from the terminal to every boundary point.
     """
     p = np.asarray(point_xy, dtype=float)
     candidates = set()
@@ -140,7 +140,7 @@ def _angular_extrema_candidates(point_xy, boundary_xy, ring_ranges, neighbour_sp
         delta = np.diff(angles)
         signs = np.sign(delta)
         if len(signs):
-            # 填充零斜率，避免平直边界遗漏极值。
+            # Fill zero slopes so flat boundary stretches do not miss extrema.
             for i in range(1, len(signs)):
                 if signs[i] == 0:
                     signs[i] = signs[i - 1]
@@ -165,7 +165,7 @@ def _select_terminal_access_points(
     max_count: int,
     candidate_limit: int,
 ):
-    """从近切点候选和最近边界候选中筛选安全接入点。"""
+    """Select safe access points from near-tangent candidates and nearest boundary candidates."""
     max_count = max(4, int(max_count))
     candidate_limit = max(max_count * 4, int(candidate_limit))
     m = len(boundary_xy)
@@ -310,14 +310,14 @@ def build_navigation_distances(
     terminal_candidate_limit: int = 64,
     target_chunk_size: int = 256,
 ):
-    """构建大规模节点对安全绕行距离矩阵。
+    """Build a large-scale pairwise safe-detour distance matrix.
 
-    `component_ids` 用于自由飞行分块。不同分块节点对直接置为不可达，避免对
-    本来不会进入同一条航线的节点对执行相交判断和绕行计算。
+    `component_ids` marks free-flight blocks. Pairs from different blocks are set unreachable so the solver does not
+    run intersection tests or detours for node pairs that never share a route.
     """
     coords = np.asarray(coords, dtype=float)
     if coords.ndim != 2 or coords.shape[1] < 2:
-        raise ValueError("coords 必须是 n×2 坐标数组")
+        raise ValueError("coords must be an n×2 coordinate array")
     coords = coords[:, :2]
     n = len(coords)
     if component_ids is None:
@@ -325,7 +325,7 @@ def build_navigation_distances(
     else:
         component_ids = np.asarray(component_ids, dtype=_INT_DTYPE)
         if len(component_ids) != n:
-            raise ValueError("component_ids 长度必须与 coords 一致")
+            raise ValueError("component_ids length must match coords")
 
     result = np.full((n, n), np.inf, dtype=_FLOAT_DTYPE)
     direct_visible = np.zeros((n, n), dtype=bool)
@@ -348,7 +348,7 @@ def build_navigation_distances(
     required_safe = original.buffer(float(clearance))
     navigation_safe = required_safe.buffer(max(float(navigation_margin), 0.05))
     if required_safe.is_empty or navigation_safe.is_empty:
-        raise ValueError("禁飞区安全排斥面为空，无法构建绕行矩阵")
+        raise ValueError("no-fly safety exclusion geometry is empty; cannot build the detour matrix")
     shapely.prepare(required_safe)
 
     boundary_xy, ring_ranges, ring_metrics, effective_step = _build_boundary_data(
@@ -357,7 +357,7 @@ def build_navigation_distances(
         max_boundary_nodes=int(max_boundary_nodes),
     )
     if not len(boundary_xy):
-        raise ValueError("未能从安全排斥面构建有效导航边界")
+        raise ValueError("failed to build a valid navigation boundary from the safety exclusion")
 
     boundary_tree = cKDTree(boundary_xy)
     access_count = min(max(4, int(boundary_neighbors)), len(boundary_xy))
@@ -365,8 +365,8 @@ def build_navigation_distances(
     access_lengths = np.full((n, access_count), np.inf, dtype=_FLOAT_DTYPE)
 
     print(
-        f"[绕行加速] 服务节点={n}，边界节点={len(boundary_xy)}，"
-        f"有效边界步长≈{effective_step:.1f}m，接入候选={access_count}"
+        f"[detour accel] service nodes={n}, boundary nodes={len(boundary_xy)}, "
+        f"effective boundary step≈{effective_step:.1f} m, access candidates={access_count}"
     )
     for terminal, point_xy in enumerate(coords):
         selected, lengths = _select_terminal_access_points(
@@ -383,7 +383,7 @@ def build_navigation_distances(
             access_indices[terminal, :count] = selected
             access_lengths[terminal, :count] = lengths
         if terminal and terminal % 500 == 0:
-            print(f"[绕行加速] 已建立端点接入候选 {terminal}/{n}")
+            print(f"[detour accel] terminal access candidates {terminal}/{n}")
 
     ring_id, ring_position, boundary_s = _boundary_ring_lookup(ring_metrics, len(boundary_xy))
     single_ring = len(ring_metrics) == 1
@@ -403,8 +403,8 @@ def build_navigation_distances(
         source_nodes = unique_access
         source_row = {int(node): row for row, node in enumerate(unique_access)}
         print(
-            f"[绕行加速] 多边界模式：仅从 {len(unique_access)} 个实际接入节点执行 Dijkstra，"
-            f"不再计算全部 {len(boundary_xy)}×{len(boundary_xy)} 边界距离。"
+            f"[detour accel] multi-ring mode: run Dijkstra only from {len(unique_access)} actual access nodes, "
+            f"instead of a full {len(boundary_xy)}×{len(boundary_xy)} boundary distance matrix."
         )
         source_distances = dijkstra(
             boundary_graph,
@@ -419,7 +419,7 @@ def build_navigation_distances(
         if len(indices) == 0:
             continue
         print(
-            f"[绕行加速] 连通分块 {component} ({comp_order}/{len(components)})：节点={len(indices)}"
+            f"[detour accel] connected block {component} ({comp_order}/{len(components)}): nodes={len(indices)}"
         )
         for local_pos, a in enumerate(indices[:-1]):
             targets = indices[local_pos + 1 :]
@@ -481,7 +481,7 @@ def build_navigation_distances(
 
             if local_pos and local_pos % 500 == 0:
                 print(
-                    f"[绕行加速] 分块 {component} 节点对进度 {local_pos}/{len(indices)}"
+                    f"[detour accel] block {component} pair progress {local_pos}/{len(indices)}"
                 )
 
     return result, {
@@ -571,7 +571,7 @@ def _graph_chain(navigation_data, source_node: int, destination_node: int):
 
 
 def navigation_leg_coordinates(navigation_data, start_terminal, end_terminal):
-    """还原单个安全航段。"""
+    """Recover a single safe flight leg."""
     if navigation_data is None:
         return None
     start_terminal = int(start_terminal)
@@ -636,7 +636,7 @@ def navigation_leg_coordinates(navigation_data, start_terminal, end_terminal):
 
 
 def route_navigation_coordinates(navigation_data, route):
-    """将服务节点序列展开为实际安全航迹。"""
+    """Expand a service-node sequence into the actual safe trajectory."""
     if navigation_data is None:
         return None
     pieces = []

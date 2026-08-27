@@ -8,7 +8,7 @@ The code treats large-area UAV farmland monitoring as a coupled location-routing
 
 ## What is implemented
 
-The workflow in [02_求解_遵化_CLRP_ALNS.py](02_求解_遵化_CLRP_ALNS.py) follows four methodological components from the manuscript:
+The workflow in [02_solve_zunhua_CLRP_ALNS.py](02_solve_zunhua_CLRP_ALNS.py) follows four methodological components from the manuscript:
 
 - **CFCPG** generates discrete panoramic acquisition points from farmland coverage circles, removes points in no-fly areas, retains farmland-related points, and partitions the study area into UAV-feasible connected subregions.
 - **VCMS-3DGE** builds DEM-based line-of-sight relationships, safe horizontal navigation distances, and directed ascent, horizontal-flight, and descent distances.
@@ -63,11 +63,10 @@ The manuscript compares a terrain-following strategy at approximately 120 m abov
 
 ```text
 .
-├── 02_求解_遵化_CLRP_ALNS.py   # Main data preparation, solver, experiment, and plotting script
-├── lib_禁飞区绕行逻辑.py        # No-fly-zone detour and safe navigation geometry
-├── lib_遵化实验公共.py          # Shared configuration and multiprocessing helpers
-├── figures/                    # Manuscript-aligned illustrations and case-study figures
-├── UAV-FCLRP.docx              # Manuscript used to document the method and experiments
+├── 02_solve_zunhua_CLRP_ALNS.py      # Main data preparation, solver, experiment, and plotting script
+├── lib_no_fly_zone_detour.py         # No-fly-zone detour and safe navigation geometry
+├── lib_zunhua_experiment_common.py   # Shared configuration and multiprocessing helpers
+├── figures/                          # Manuscript-aligned illustrations and case-study figures
 └── LICENSE
 ```
 
@@ -75,23 +74,23 @@ The current repository does not include the Zunhua GIS data directory or Barreto
 
 ## Data directory expected by the script
 
-The main script searches for `FCLRP遵化数据` next to the repository directory (`_REPO_ROOT` in the script), with the following files:
+The main script searches for `FCLRP_Zunhua_data` next to the repository directory (`_REPO_ROOT` in the script), with the following files:
 
 ```text
-FCLRP遵化数据/
-├── 遵化随机起点集2000/        # One or more candidate-site Shapefiles
-├── 遵化市域边界数据/
-│   ├── 遵化市.shp             # WGS84 source boundary
-│   └── 遵化市_UTM50N.shp      # Meter-based working boundary, generated if absent
-├── 河北铁路数据/
+FCLRP_Zunhua_data/
+├── zunhua_random_depots_2000/     # One or more candidate-site Shapefiles
+├── zunhua_admin_boundary/
+│   ├── zunhua.shp                 # WGS84 source boundary
+│   └── zunhua_UTM50N.shp          # Meter-based working boundary, generated if absent
+├── hebei_railway/
 │   └── hebei_railway.shp
-├── 遵化地块数据/
+├── zunhua_farmland/
 │   └── 2020_class_11_12.shp
-└── 遵化DEM数据/
-    └── Zunhua_DEM_12.5_wgs84_研究区插值修复.tif
+└── zunhua_DEM/
+    └── Zunhua_DEM_12.5_wgs84_study_area_interpolated.tif
 ```
 
-All Shapefile sidecar files (`.shx`, `.dbf`, `.prj`, and any other required sidecars) must be present. The working boundary must use a meter-based projected CRS; if `遵化市_UTM50N.shp` and its projection file are absent, the script attempts to create them from `遵化市.shp` using EPSG:32650.
+All Shapefile sidecar files (`.shx`, `.dbf`, `.prj`, and any other required sidecars) must be present. The working boundary must use a meter-based projected CRS; if `zunhua_UTM50N.shp` and its projection file are absent, the script attempts to create them from `zunhua.shp` using EPSG:32650.
 
 ## Installation
 
@@ -108,7 +107,7 @@ python -m pip install numpy rasterio matplotlib shapely pyshp pyproj geopandas p
 After placing the required data directory in the expected location, run:
 
 ```bash
-python 02_求解_遵化_CLRP_ALNS.py
+python 02_solve_zunhua_CLRP_ALNS.py
 ```
 
 The default configuration in the script uses:
@@ -134,16 +133,16 @@ For a quick smoke test, temporarily reduce `CLRP_PARALLEL_RANDOM_SEEDS`, `CLRP_M
 Results are written under the script directory:
 
 ```text
-outputs/CLRP_遵化/
-└── 有禁飞区_迭代_1000/
-    ├── 遵化_experiment_summary_有禁飞区.csv
-    ├── 遵化_block_summary_有禁飞区.csv
-    ├── 遵化_all_iterations_有禁飞区.csv
-    ├── 遵化_experiment_statistics_有禁飞区.csv
-    └── 种子_11/
-        ├── 遵化_solution_result_有禁飞区_seed_11.json
-        ├── 遵化_solution_有禁飞区_seed_11.png
-        ├── 遵化_route_3d_segments_有禁飞区_seed_11.csv
+outputs/CLRP_zunhua/
+└── with_no_fly_zone_iter_1000/
+    ├── zunhua_experiment_summary_with_no_fly_zone.csv
+    ├── zunhua_block_summary_with_no_fly_zone.csv
+    ├── zunhua_all_iterations_with_no_fly_zone.csv
+    ├── zunhua_experiment_statistics_with_no_fly_zone.csv
+    └── seed_11/
+        ├── zunhua_solution_result_with_no_fly_zone_seed_11.json
+        ├── zunhua_solution_with_no_fly_zone_seed_11.png
+        ├── zunhua_route_3d_segments_with_no_fly_zone_seed_11.csv
         └── ...
 ```
 
