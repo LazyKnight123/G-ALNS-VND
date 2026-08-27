@@ -6,6 +6,65 @@ The code treats large-area UAV farmland monitoring as a coupled location-routing
 
 ![Overall framework](figures/fig1_overall_workflow.png)
 
+## Quick Start
+
+### 1. Environment
+
+- **Python** 3.10 or newer
+- **OS:** Windows / Linux / macOS (Windows uses `spawn` multiprocessing; run from the repository root)
+
+```bash
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# Linux/macOS: source .venv/bin/activate
+
+python -m pip install --upgrade pip
+python -m pip install numpy scipy rasterio matplotlib shapely pyshp pyproj geopandas
+```
+
+`geopandas` is only required when the metric boundary `zunhua_UTM50N.shp` must be generated from `zunhua.shp`.
+
+### 2. Prepare data
+
+Place the Zunhua GIS folder **next to** this repository (not inside it):
+
+```text
+Python_Projects/
+├── G-ALNS-VND-main/          # this repo
+└── FCLRP_Zunhua_data/        # required input data
+    ├── zunhua_random_depots_2000/
+    ├── zunhua_admin_boundary/
+    ├── hebei_railway/
+    ├── zunhua_farmland/
+    └── zunhua_DEM/
+```
+
+See [Data directory](#data-directory-expected-by-the-script) for the full file list.
+
+### 3. Run
+
+From the repository root:
+
+```bash
+python 02_solve_zunhua_CLRP_ALNS.py
+```
+
+Default run: no-fly zones enabled, 1,000 ALNS iterations, five random seeds (`11, 23, 37, 72, 211`), up to eight worker processes.
+
+For a quick smoke test, temporarily reduce near the top of the script:
+
+```python
+CLRP_PARALLEL_RANDOM_SEEDS = [11]
+CLRP_MAX_ITER = 50
+CLRP_PARALLEL_MAX_WORKERS = 2
+```
+
+### 4. Outputs
+
+Results are written to `outputs/CLRP_zunhua/`; reusable matrix checkpoints go to `checkpoints/`. See [Outputs](#outputs) for the full layout.
+
+To replot a saved solution without rerunning the solver, set `CLRP_REPLOT_RESULT_JSON` to a saved `*_solution_result_*.json` path and run the script again.
+
 ## What is implemented
 
 The workflow in [02_solve_zunhua_CLRP_ALNS.py](02_solve_zunhua_CLRP_ALNS.py) follows four methodological components from the manuscript:
@@ -94,17 +153,17 @@ All Shapefile sidecar files (`.shx`, `.dbf`, `.prj`, and any other required side
 
 ## Installation
 
-Use Python 3.10 or newer and install the scientific, geospatial, and plotting dependencies:
+See [Quick Start](#quick-start) for the recommended setup. Core dependencies:
 
 ```bash
-python -m pip install numpy rasterio matplotlib shapely pyshp pyproj geopandas python-docx
+python -m pip install numpy scipy rasterio matplotlib shapely pyshp pyproj geopandas
 ```
 
 `geopandas` is only needed when the projected administrative boundary has to be generated. On Windows, run the script from the repository root so multiprocessing can resolve both helper modules and the data paths correctly.
 
 ## Run the Zunhua experiment
 
-After placing the required data directory in the expected location, run:
+See [Quick Start](#quick-start). After placing `FCLRP_Zunhua_data` in the expected location:
 
 ```bash
 python 02_solve_zunhua_CLRP_ALNS.py
